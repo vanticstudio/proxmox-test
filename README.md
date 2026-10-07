@@ -2,6 +2,8 @@
 
 **A Claude skill that stress-tests every part of your Proxmox VE host over SSH, one part at a time, and tells you in plain English whether each part runs as well as it should.**
 
+> **Where the skill lives:** the skill itself is in [`skill/proxmox-hardware-stress-test/`](skill/proxmox-hardware-stress-test/) (start with its [`SKILL.md`](skill/proxmox-hardware-stress-test/SKILL.md)). Ready-to-install copies are in [`dist/`](dist/): the `.skill` and `.zip` contain exactly the same files as that folder. Everything else in this repo is documentation and tooling.
+
 You ask Claude something like *"stress test my Proxmox server and tell me if everything is running properly"*. The skill finds all your hardware, shows you a test plan, loads each part in turn while logging sensors every second, compares the results with spec sheets, and hands you a scored report as Markdown, HTML and PDF.
 
 > A **skill** is a folder of instructions and scripts that Claude loads when a task needs it. This repository is that folder, plus ready-made packages and documentation.
@@ -75,7 +77,7 @@ And ask Claude, for example:
 
 > Run a 5-minute burn-in on my Proxmox box at 192.0.2.10 and check the CPU temps and NVMe speed.
 
-Repository: `https://github.com/<your-github-user>/proxmox-hardware-stress-test`
+Repository: `https://github.com/vanticstudio/proxmox-test`
 
 ## What's in the box: `skill/` vs `dist/`
 

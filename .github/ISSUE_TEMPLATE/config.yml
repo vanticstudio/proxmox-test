@@ -1,6 +1,5 @@
-# Replace <your-github-user> with your GitHub username or organisation.
 blank_issues_enabled: false
 contact_links:
   - name: Report a security problem privately
-    url: https://github.com/<your-github-user>/proxmox-hardware-stress-test/security/advisories/new
+    url: https://github.com/vanticstudio/proxmox-test/security/advisories/new
     about: Please do not open a public issue for security problems. Use a private security advisory instead (see SECURITY.md).

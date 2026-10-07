@@ -45,7 +45,7 @@ Step 3 should print a `pve-manager/...` line. If your SSH port is not 22, add `-
 ## Option 1: One-click `.skill` file (Claude apps)
 
 1. Download `dist/proxmox-hardware-stress-test.skill` from the repository (or from the Releases page, if there is one):
-   `https://github.com/<your-github-user>/proxmox-hardware-stress-test`
+   `https://github.com/vanticstudio/proxmox-test`
 2. In your Claude app, open the skills settings and upload the file. In the claude.ai apps this is under **Settings -> Capabilities -> Skills**. (Menu names can change between app versions.)
 3. Make sure the skill is switched on.
 
@@ -68,8 +68,8 @@ Run this from the repository root.
 
 ```bash
 git clone --depth 1 --filter=blob:none --sparse \
-  https://github.com/<your-github-user>/proxmox-hardware-stress-test.git
-cd proxmox-hardware-stress-test
+  https://github.com/vanticstudio/proxmox-test.git
+cd proxmox-test
 git sparse-checkout set skill
 mkdir -p ~/.claude/skills
 cp -R skill/proxmox-hardware-stress-test ~/.claude/skills/
@@ -78,9 +78,9 @@ cp -R skill/proxmox-hardware-stress-test ~/.claude/skills/
 **c) Full clone:**
 
 ```bash
-git clone https://github.com/<your-github-user>/proxmox-hardware-stress-test.git
+git clone https://github.com/vanticstudio/proxmox-test.git
 mkdir -p ~/.claude/skills
-cp -R proxmox-hardware-stress-test/skill/proxmox-hardware-stress-test ~/.claude/skills/
+cp -R proxmox-test/skill/proxmox-hardware-stress-test ~/.claude/skills/
 ```
 
 To update later: `git pull` in your clone, then copy the folder again (delete the old copy first so removed files don't linger). If you plan to edit the skill, a symlink is handier than a copy; see [developing.md](developing.md#working-on-the-skill-locally).

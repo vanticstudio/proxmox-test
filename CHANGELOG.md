@@ -31,5 +31,5 @@ Initial public release.
 - **Developer mock hook:** `PVE_STRESS_MOCK_DIR` lets `inventory.py` run against simulated hosts on any machine.
 - **Packaging:** `dist/` with identical `.skill` and `.zip` archives plus `SHA256SUMS`, rebuilt by `tools/build.sh`.
 
-[Unreleased]: https://github.com/<your-github-user>/proxmox-hardware-stress-test/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/<your-github-user>/proxmox-hardware-stress-test/releases/tag/v1.0.0
+[Unreleased]: https://github.com/vanticstudio/proxmox-test/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/vanticstudio/proxmox-test/releases/tag/v1.0.0

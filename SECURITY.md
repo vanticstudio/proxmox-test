@@ -66,7 +66,7 @@ One caveat: if another process installs packages at exactly the same moment as p
 
 If the skill wrote, deleted or changed anything it shouldn't have, touched a guest or a passthrough device, or could be made to do so, please report it **privately**:
 
-1. Go to the repository's **Security** tab: `https://github.com/<your-github-user>/proxmox-hardware-stress-test/security/advisories/new`
+1. Go to the repository's **Security** tab: `https://github.com/vanticstudio/proxmox-test/security/advisories/new`
 2. Choose **Report a vulnerability** and describe what happened, the step (plan, which test unit, cleanup), the storage / GPU layout in general terms, and the relevant log lines (redacted).
 
 Please don't open a public issue for safety problems until a fix is out. You'll get an acknowledgement as soon as the maintainer can, and credit in the changelog if you'd like it.
