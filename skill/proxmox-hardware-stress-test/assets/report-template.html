@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{HOST_NAME}} Stress Test</title>
+<!--
+  HTML REPORT TEMPLATE for the proxmox-hardware-stress-test skill.
+  How to fill it (Claude): copy this file to <local folder>/pve-stress-report-<duration>.html and replace every {{PLACEHOLDER}}
+  with values from the finished Markdown report (which in turn comes from inventory.json, plan.json and the summary.json files).
+  Keep the class names and structure: the CSS below is the design. When done, no "{{" may remain (grep -c '{{' must print 0),
+  and every example row/card you did not use must be deleted. Content rules:
+    - The page scales with the host. A "unit" is one entry of plan.json .units[] (CPU, RAM, GPU 1..n, SSD 1..n, HDD 1..n, pools).
+      Use the same labels as the Markdown report ("SSD 2", "GPU 1") and ids: cpu, ram, gpu-1, gpu-2, ssd-1, ..., hdd-1, ...
+    - Nav: one link per TESTED unit, in run order, between "Hardware" and "To do". It scrolls sideways when there are many.
+    - One .card per unit in the "At a glance" grid, grouped by category with a <h3 class="grp"> before each group when the host has
+      more than ~6 units. Tested units link to their sheet. Skipped units: <div class="card skipped"> with the reason instead of a score.
+      Parts the host does not have at all: one "card skipped" with "Not present" (e.g. GPU).
+    - "Your hardware": fill every block from the Markdown "Your hardware" section. One table row per socket, per DIMM slot
+      (empty slots too, class "empty" on the <tr>), per GPU, per controller, per disk, per NIC. If a category is absent, keep its
+      block with one row/line saying "None found". The "Tested" column uses .pill (tested), .pill.warn (tested with warnings),
+      .pill.fail (failed) or .pill.muted (skipped / not tested, with a short reason). No serials, MACs, WWNs or UUIDs.
+    - Gauge/bar widths are percentages of a 0-120% scale: width = (percent / 120 * 100)%. 100% of expected sits at 83.33%.
+      Cap fills at 100%. Minibars in the cards use the same scale.
+    - Headroom rows: one per TESTED unit with a temperature reading. fill width = peak_temp / 110 * 100 %, limit marker
+      left = limit / 110 * 100 %. Omit the marker when there is no limit; omit the row when the unit has no sensor.
+    - One <section class="sheet"> per tested unit, in run order (sheet title = the unit label, e.g. "SSD 2", model line = model + device).
+      A skipped unit may get a short <section class="sheet skipped"> with only the top line and one sentence why; absent parts get none.
+      Disks read in read-only mode: say "read-only test, no write scores" in the model line and leave write tests out of the gauge. Each has: top line + pill, a 2-3 sentence plain-English lede,
+      4 stat tiles, a gauge with the part's main "% of expected" results, two takeaway boxes, and a <details> table with all scores.
+    - Pill / verdict classes: default = pass (green). Use class "warn" on .pill/.verdict for parts below ~90% or with warnings,
+      and "fail" for errors or thermal throttling.
+    - Keep the copy short, plain English, no jargon without a short explanation. Use only numbers from the run's logs.
+  The finish script (scripts/finish_report.py) embeds the Google Fonts below as data URIs (self-contained file), makes the PDF
+  (with every <details> opened) and opens this HTML in the default browser.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link data-embed-fonts rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a bench-test lab sheet. Verdict strip, one card per part, then one compact sheet per part with a %-of-expected gauge. */
+:root{
+  --bg:#f3f5f6; --panel:#ffffff; --ink:#18232b; --muted:#5d6c76; --rule:#d9e0e4;
+  --accent:#0f6c8c; --accent-soft:#e1eff5;
+  --pass:#1d7a4f; --pass-soft:#e2f2e9; --warn:#a4620b; --warn-soft:#fbefdc; --fail:#b3261e; --fail-soft:#fbe4e2;
+  --bar:#c9d6dc; --ref:#18232b;
+  --display:"Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body:"Atkinson Hyperlegible", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0f1519; --panel:#162027; --ink:#e3eaee; --muted:#93a3ad; --rule:#26343d;
+  --accent:#5cb8d6; --accent-soft:#16303b;
+  --pass:#5bc58e; --pass-soft:#163327; --warn:#e3a54a; --warn-soft:#3a2a12; --fail:#f2857c; --fail-soft:#3b1a17;
+  --bar:#2e3e48; --ref:#e3eaee; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f1519; --panel:#162027; --ink:#e3eaee; --muted:#93a3ad; --rule:#26343d;
+  --accent:#5cb8d6; --accent-soft:#16303b;
+  --pass:#5bc58e; --pass-soft:#163327; --warn:#e3a54a; --warn-soft:#3a2a12; --fail:#f2857c; --fail-soft:#3b1a17;
+  --bar:#2e3e48; --ref:#e3eaee; color-scheme:dark}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{background:var(--bg);color:var(--ink);font-family:var(--body);font-size:16px;line-height:1.55;margin:0}
+.wrap{max-width:980px;margin:0 auto;padding-inline:20px;padding-block:28px 64px}
+h1,h2,h3{font-family:var(--display);line-height:1.15;text-wrap:balance;margin:0}
+p{margin:0}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+a{color:var(--accent)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+header.top{display:grid;gap:14px;padding-bottom:22px;border-bottom:1px solid var(--rule)}
+header.top h1{font-size:clamp(30px,5vw,46px);font-weight:700;letter-spacing:-.01em}
+.meta{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--muted);font-size:14px}
+.verdict{display:flex;gap:14px;align-items:flex-start;background:var(--pass-soft);border:1px solid color-mix(in srgb,var(--pass) 35%,transparent);border-radius:10px;padding:16px 18px}
+.verdict .badge{flex:none;font-family:var(--mono);font-weight:600;font-size:13px;color:var(--panel);background:var(--pass);border-radius:6px;padding:4px 9px;margin-top:2px}
+.verdict.warn{background:var(--warn-soft);border-color:color-mix(in srgb,var(--warn) 35%,transparent)}.verdict.warn .badge{background:var(--warn)}
+.verdict.fail{background:var(--fail-soft);border-color:color-mix(in srgb,var(--fail) 35%,transparent)}.verdict.fail .badge{background:var(--fail)}
+.verdict p{max-width:68ch}
+.verdict strong{font-family:var(--display);font-size:19px;display:block;margin-bottom:2px}
+
+nav.parts{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--bg);display:flex;flex-wrap:nowrap;gap:6px;overflow-x:auto;overscroll-behavior-x:contain;scroll-snap-type:x proximity;scrollbar-width:thin;padding-block:10px;margin-top:6px;border-bottom:1px solid var(--rule);
+  -webkit-mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent);mask-image:linear-gradient(90deg,#000 calc(100% - 28px),transparent);padding-inline-end:28px}
+nav.parts .sep{flex:none;width:1px;background:var(--rule);margin-inline:4px}
+nav.parts a{flex:none;scroll-snap-align:start;text-decoration:none;color:var(--ink);font-family:var(--mono);font-size:13px;padding:5px 11px;border:1px solid var(--rule);border-radius:999px;background:var(--panel)}
+nav.parts a:hover{border-color:var(--accent);color:var(--accent)}
+
+section{margin-top:44px}
+.sec-head{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 16px;margin-bottom:16px}
+.sec-head h2{font-size:26px;font-weight:700}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px}
+.cards .grp{grid-column:1/-1;font-family:var(--mono);font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:8px 0 -2px;padding-bottom:4px;border-bottom:1px solid var(--rule)}
+.cards .grp:first-child{margin-top:0}
+.card .dev{font-family:var(--mono);font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card.skipped{background:transparent;border-style:dashed}
+.card.skipped .score{font-size:22px;color:var(--muted)}
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:14px 14px 12px;display:grid;gap:6px;text-decoration:none;color:inherit;min-width:0}
+.card:hover{border-color:var(--accent)}
+.card .lbl{font-family:var(--mono);font-size:12px;letter-spacing:.06em;color:var(--muted);text-transform:uppercase}
+.card .score{font-family:var(--display);font-size:34px;font-weight:700;line-height:1}
+.card .score small{font-size:16px;font-weight:600;color:var(--muted)}
+.card .key{font-size:13.5px;color:var(--muted);line-height:1.35}
+.card .ok{font-family:var(--mono);font-size:12px;color:var(--pass)}
+.card.warn .ok{color:var(--warn)}.card.fail .ok{color:var(--fail)}.card.skipped .ok{color:var(--muted)}
+.minibar{height:6px;border-radius:3px;background:var(--bar);position:relative;overflow:hidden}
+.minibar i{position:absolute;inset:0 auto 0 0;background:var(--pass);border-radius:3px}
+.card.warn .minibar i{background:var(--warn)}.card.fail .minibar i{background:var(--fail)}
+.minibar b{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--ref)}
+
+.headroom{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:16px 18px;display:grid;gap:12px;margin-top:12px}
+.hr-row{display:grid;grid-template-columns:84px minmax(0,1fr) 128px;gap:12px;align-items:center;font-size:14px}
+.hr-row .nm{font-family:var(--mono);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hr-track{position:relative;height:14px;border-radius:7px;background:var(--bar)}
+.hr-fill{position:absolute;inset:0 auto 0 0;border-radius:7px;background:var(--accent)}
+.hr-lim{position:absolute;top:-4px;bottom:-4px;width:2px;background:var(--warn)}
+.hr-row .val{font-family:var(--mono);font-size:13px;color:var(--muted);text-align:right}
+.hr-axis{display:grid;grid-template-columns:84px minmax(0,1fr) 128px;gap:12px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.hr-axis div:nth-child(2){display:flex;justify-content:space-between}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.sw{width:12px;height:12px;border-radius:3px;display:inline-block}
+
+.sheet{background:var(--panel);border:1px solid var(--rule);border-radius:12px;padding:22px 22px 18px;display:grid;gap:18px;scroll-margin-top:64px}
+.sheet-top{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:baseline;justify-content:space-between}
+.sheet-top h2{font-size:24px}
+.sheet-top .model{color:var(--muted);font-size:14px}
+.pill{font-family:var(--mono);font-size:12px;padding:3px 9px;border-radius:999px;background:var(--pass-soft);color:var(--pass);white-space:nowrap}
+.pill.warn{background:var(--warn-soft);color:var(--warn)}.pill.fail{background:var(--fail-soft);color:var(--fail)}
+.pill.muted{background:var(--bg);color:var(--muted);border:1px solid var(--rule)}
+.sheet.skipped{background:transparent;border-style:dashed;gap:8px;padding-block:16px}
+.sheet.skipped p{color:var(--muted);font-size:14.5px}
+.lede{max-width:70ch}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:8px;overflow:hidden}
+.stat{background:var(--panel);padding:12px 14px;display:grid;gap:2px;min-width:0}
+.stat .k{font-size:12.5px;color:var(--muted)}
+.stat .v{font-family:var(--mono);font-size:19px;font-weight:600;font-variant-numeric:tabular-nums}
+.stat .s{font-size:12.5px;color:var(--muted)}
+
+.gauge{display:grid;gap:9px}
+.g-row{display:grid;grid-template-columns:minmax(0,190px) minmax(0,1fr) 56px;gap:12px;align-items:center;font-size:14px}
+.g-row .t{min-width:0}
+.g-track{position:relative;height:12px;border-radius:6px;background:var(--bar)}
+.g-fill{position:absolute;inset:0 auto 0 0;border-radius:6px;background:var(--pass)}
+.g-row.warn .g-fill{background:var(--warn)}.g-row.fail .g-fill{background:var(--fail)}
+.g-ref{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ref)}
+.g-row .p{font-family:var(--mono);font-size:13px;text-align:right}
+.g-scale{display:grid;grid-template-columns:minmax(0,190px) minmax(0,1fr) 56px;gap:12px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.g-scale .ticks{position:relative;height:14px}
+.g-scale .ticks span{position:absolute;transform:translateX(-50%)}
+
+.takeaway{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.takeaway div{background:var(--accent-soft);border-radius:8px;padding:12px 14px;font-size:14.5px;min-width:0}
+.takeaway h3{font-size:13px;font-family:var(--mono);font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);margin-bottom:4px}
+
+details{border-top:1px solid var(--rule);padding-top:12px}
+summary{cursor:pointer;font-family:var(--mono);font-size:13px;color:var(--accent)}
+.tbl{overflow-x:auto;margin-top:10px}
+table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:560px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--rule);vertical-align:top}
+th{font-family:var(--mono);font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);font-weight:600}
+td.n{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+
+.recs{display:grid;gap:10px;counter-reset:r}
+.rec{display:grid;grid-template-columns:34px minmax(0,1fr);gap:12px;background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:14px 16px}
+.rec::before{counter-increment:r;content:counter(r);font-family:var(--display);font-weight:700;font-size:20px;color:var(--accent)}
+.rec strong{display:block;font-family:var(--display);font-size:17px}
+.rec p{font-size:14.5px;color:var(--muted)}
+.tag{font-family:var(--mono);font-size:11px;padding:2px 7px;border-radius:4px;margin-left:6px;vertical-align:2px}
+.tag.do{background:var(--warn-soft);color:var(--warn)}
+.tag.opt{background:var(--accent-soft);color:var(--accent)}
+
+/* Your hardware: one block per category, compact spec tables that scroll sideways on narrow screens. */
+.hw{display:grid;grid-template-columns:minmax(0,1fr);gap:12px}
+.hw-block{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:14px 16px 8px;min-width:0}
+.hw-block h3{font-size:17px;display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:4px 12px}
+.hw-block h3 .eyebrow{font-size:11px;font-weight:400}
+.hw-block .tbl{margin-top:6px}
+.hw-block table{min-width:520px}
+.hw-block th{white-space:nowrap}
+.hw-block tr:last-child td{border-bottom:none}
+.hw-block tr.empty td{color:var(--muted)}
+.specs{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:1px;background:var(--rule);border:1px solid var(--rule);border-radius:8px;overflow:hidden;margin:8px 0 8px}
+.specs div{background:var(--panel);padding:9px 12px;display:grid;gap:1px;min-width:0}
+.specs dt{font-size:12px;color:var(--muted)}
+.specs dd{margin:0;font-family:var(--mono);font-size:13.5px;overflow-wrap:anywhere}
+.hw-pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+
+.limits{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.limits div{border-top:1px solid var(--rule);padding-top:10px;font-size:14.5px;min-width:0}
+.limits strong{display:block}
+footer{margin-top:44px;padding-top:16px;border-top:1px solid var(--rule);color:var(--muted);font-size:13.5px;display:grid;gap:6px}
+code{font-family:var(--mono);font-size:.9em;background:var(--accent-soft);padding:1px 5px;border-radius:4px;overflow-wrap:anywhere}
+
+@media (max-width:620px){
+  .takeaway,.limits,.hw-pair{grid-template-columns:1fr}
+  .hw-block{padding-inline:12px}
+  .g-row,.g-scale{grid-template-columns:minmax(0,1fr) 52px}
+  .g-row .t{grid-column:1/-1}
+  .g-scale .lead{display:none}
+  .g-scale .ticks{grid-column:1}
+  .hr-row,.hr-axis{grid-template-columns:64px minmax(0,1fr) 88px}
+  .sheet{padding:18px 16px 14px}
+}
+@media (prefers-reduced-motion:no-preference){.card,.rec{transition:border-color .15s}}
+
+/* Print / PDF: light palette, no sticky nav, whole sections kept together where possible. */
+@media print{
+  :root{--bg:#ffffff;--panel:#ffffff;color-scheme:light}
+  body{font-size:12.5px}
+  .wrap{max-width:none;padding-block:0}
+  nav.parts{display:none}
+  section{margin-top:22px}
+  .sheet{break-inside:avoid-page;border-color:#cfd8dc}
+  .card,.rec,.headroom,.stats,.gauge,.takeaway,.hw-block,.specs{break-inside:avoid}
+  .cards{grid-template-columns:repeat(4,minmax(0,1fr))}
+  .tbl{overflow:visible}
+  table,.hw-block table{min-width:0}
+  nav.parts{-webkit-mask-image:none;mask-image:none}
+  details{border-top:none;padding-top:0}
+  summary{display:none}
+  a{color:inherit;text-decoration:none}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div class="eyebrow">Proxmox host · hardware stress test</div>
+  <h1>{{HEADLINE e.g. "Every part passed, and runs at its rated speed"}}</h1>
+  <div class="meta">
+    <span>{{DATE_TIME_RANGE}}</span>
+    <span>{{HARDWARE_ONE_LINE e.g. CPU model · RAM · GPU · disks}}</span>
+    <span>{{DURATION_PER_PART e.g. 30 s per part}}</span>
+    <span>{{GUESTS e.g. No VMs running}}</span>
+  </div>
+  <!-- class: verdict | verdict warn | verdict fail -->
+  <div class="verdict">
+    <span class="badge">{{PASSED}} / {{TESTED}} PASS</span>
+    <p><strong>{{ONE_LINE_VERDICT e.g. "Healthy. Nothing needs changing."}}</strong>{{2-3 SENTENCE SUMMARY: method in one clause, average % of expected, throttling/errors, what limits the parts}}</p>
+  </div>
+</header>
+
+<nav class="parts" aria-label="Jump to a part">
+  <!-- One link per TESTED unit between the two separators, in run order (gpu-1, gpu-2 ..., ssd-1, ssd-2 ..., hdd-1 ...). -->
+  <a href="#overview">Overview</a><a href="#hardware">Hardware</a><span class="sep" aria-hidden="true"></span>
+  <a href="#cpu">CPU</a><a href="#ram">RAM</a><a href="#gpu-1">GPU 1</a><a href="#ssd-1">SSD 1</a><a href="#hdd-1">HDD 1</a>
+  <span class="sep" aria-hidden="true"></span><a href="#todo">To do</a><a href="#limits">Limits</a>
+</nav>
+
+<section id="overview">
+  <div class="sec-head"><h2>At a glance</h2><span class="eyebrow">Part score = average % of expected · 100% = exactly as it should be</span></div>
+  <div class="cards">
+    <!-- REPEAT one card per unit, in run order. minibar fill width = score/120*100 %, reference marker at 83.33%.
+         card class: card | card warn | card fail | card skipped. With more than ~6 units, start each category with
+         <h3 class="grp">Disks · 6 SSDs, 4 HDDs</h3> (one per category: Compute, GPUs, Disks). -->
+    <a class="card" href="#cpu"><span class="lbl">CPU</span><span class="score">{{SCORE}}<small>%</small></span>
+      <div class="minibar" aria-hidden="true"><i style="width:{{SCORE/120*100}}%"></i><b style="left:83.33%"></b></div>
+      <span class="key">{{2-3 KEY FIGURES e.g. 7-Zip 120,000 MIPS · 150 W · 78 °C}}</span><span class="ok">✓ optimal</span></a>
+    <!-- Disk card example (note the .dev line):
+    <a class="card" href="#ssd-1"><span class="lbl">SSD 1</span><span class="dev">{{MODEL}} · {{DEV e.g. nvme0n1}}</span><span class="score">{{SCORE}}<small>%</small></span>
+      <div class="minibar" aria-hidden="true"><i style="width:{{SCORE/120*100}}%"></i><b style="left:83.33%"></b></div>
+      <span class="key">{{e.g. 3,500 MB/s read · 3,000 MB/s write · 45 °C}}</span><span class="ok">✓ optimal</span></a> -->
+    <!-- Skipped unit / absent part examples:
+    <div class="card skipped"><span class="lbl">SSD 3</span><span class="dev">{{MODEL}} · {{DEV}}</span><span class="score">skipped</span><span class="key">{{REASON e.g. USB disk, not requested}}</span><span class="ok">not tested</span></div>
+    <div class="card skipped"><span class="lbl">GPU</span><span class="score">none</span><span class="key">Not present</span><span class="ok">not tested</span></div> -->
+  </div>
+
+  <div class="headroom" role="img" aria-label="{{ALT TEXT listing each part's peak temperature and limit}}">
+    <div class="sec-head" style="margin:0"><h3 style="font-size:17px">Cooling headroom under full load</h3>
+      <div class="legend"><span><i class="sw" style="background:var(--accent)"></i>peak temperature</span><span><i class="sw" style="background:var(--warn);width:3px"></i>slow-down limit</span></div></div>
+    <!-- REPEAT per part: fill = peak/110*100 %, limit marker = limit/110*100 % (omit .hr-lim when unknown). -->
+    <div class="hr-row"><span class="nm">CPU</span><div class="hr-track"><div class="hr-fill" style="width:{{PEAK/110*100}}%"></div><div class="hr-lim" style="left:{{LIMIT/110*100}}%"></div></div><span class="val">{{PEAK}} / {{LIMIT}} °C</span></div>
+    <div class="hr-axis"><div></div><div><span>0</span><span>55</span><span>110 °C</span></div><div></div></div>
+  </div>
+</section>
+
+<section id="hardware">
+  <div class="sec-head"><h2>Your hardware</h2><span class="eyebrow">{{e.g. 1 CPU · 4 of 4 DIMM slots · 1 GPU · 3 disks}} · found automatically</span></div>
+  <div class="hw">
+    <div class="hw-block"><h3>System</h3>
+      <dl class="specs">
+        <div><dt>Board / system</dt><dd>{{VENDOR MODEL}}</dd></div>
+        <div><dt>BIOS</dt><dd>{{VERSION, DATE}}</dd></div>
+        <div><dt>Firmware</dt><dd>{{UEFI · Secure Boot off}}</dd></div>
+        <div><dt>Proxmox / kernel</dt><dd>{{PVE x.y · kernel x.y}}</dd></div>
+        <div><dt>Virtualisation</dt><dd>{{VT-x on · IOMMU on}}</dd></div>
+        <div><dt>Memory capacity</dt><dd>{{TOTAL GB · max N GB · ECC yes/no}}</dd></div>
+      </dl>
+    </div>
+    <div class="hw-block"><h3>CPU <span class="eyebrow">{{N}} socket(s)</span></h3>
+      <div class="tbl"><table>
+        <tr><th>Socket</th><th>Model</th><th>Cores / threads</th><th>Clock</th><th>Cache</th><th>Tested</th></tr>
+        <!-- REPEAT per socket -->
+        <tr><td class="n">{{0}}</td><td>{{MODEL}}</td><td class="n">{{C (P+E) / T}}</td><td class="n">{{MIN-MAX GHz}}</td><td class="n">{{L3 MB}}</td><td><span class="pill">tested</span></td></tr>
+      </table></div>
+    </div>
+    <div class="hw-block"><h3>Memory <span class="eyebrow">{{POPULATED}} of {{SLOTS}} slots · {{TOTAL}} GB</span></h3>
+      <div class="tbl"><table>
+        <tr><th>Slot</th><th>Size</th><th>Type / speed</th><th>Maker / part</th><th>Rank</th></tr>
+        <!-- REPEAT per slot; empty slot: <tr class="empty"><td>{{SLOT}}</td><td>empty</td><td>-</td><td>-</td><td>-</td></tr> -->
+        <tr><td>{{SLOT}}</td><td class="n">{{SIZE}}</td><td class="n">{{TYPE-SPEED (configured / rated)}}</td><td>{{MAKER PART}}</td><td class="n">{{RANK}}</td></tr>
+      </table></div>
+    </div>
+    <div class="hw-block"><h3>GPUs <span class="eyebrow">{{N}} found</span></h3>
+      <div class="tbl"><table>
+        <tr><th>Unit</th><th>Model</th><th>Driver</th><th>VRAM</th><th>PCIe link</th><th>Tested</th></tr>
+        <!-- REPEAT per GPU; none: <tr class="empty"><td colspan="6">None found</td></tr>; not tested: <span class="pill muted">skipped · {{REASON}}</span> -->
+        <tr><td>{{GPU 1}}</td><td>{{MODEL}}</td><td>{{DRIVER VERSION}}</td><td class="n">{{GB}}</td><td class="n">{{GenN xN}}</td><td><span class="pill">tested</span></td></tr>
+      </table></div>
+    </div>
+    <div class="hw-block"><h3>Storage <span class="eyebrow">{{N}} controllers · {{N}} disks</span></h3>
+      <div class="tbl"><table>
+        <tr><th>Unit</th><th>Model</th><th>Interface / controller</th><th>Size</th><th>Health · wear · hours</th><th>Used for</th><th>Method</th><th>Tested</th></tr>
+        <!-- REPEAT per disk, grouped by controller; method: write+read (test file path) | read-only (whole disk) | pool | skipped -->
+        <tr><td>{{SSD 1}}</td><td>{{MODEL}} <span class="eyebrow">{{DEV}}</span></td><td>{{NVMe · PCIe GenN xN}}</td><td class="n">{{TB}}</td><td class="n">{{PASSED · N% · N h}}</td><td>{{ROLE}}</td><td>{{file}}</td><td><span class="pill">tested</span></td></tr>
+      </table></div>
+    </div>
+    <div class="hw-block"><h3>Network <span class="eyebrow">{{N}} interfaces · not stress-tested</span></h3>
+      <div class="tbl"><table>
+        <tr><th>Interface</th><th>Model</th><th>Driver</th><th>Link</th><th>Role</th></tr>
+        <!-- REPEAT per NIC -->
+        <tr><td class="n">{{NAME}}</td><td>{{MODEL}}</td><td>{{DRIVER}}</td><td class="n">{{SPEED or no link}}</td><td>{{ROLE e.g. bridge / unused}}</td></tr>
+      </table></div>
+    </div>
+  </div>
+</section>
+
+<!-- REPEAT one sheet per TESTED unit, in run order (cpu, ram, gpu-1, gpu-2 ..., ssd-1, ssd-2 ..., hdd-1 ...). pill class: pill | pill warn | pill fail
+     Skipped unit (optional):
+     <section id="ssd-3" class="sheet skipped"><div class="sheet-top"><div><h2>SSD 3</h2><div class="model">{{MODEL · DEV}}</div></div><span class="pill muted">skipped</span></div><p>{{REASON + what would be needed to test it}}</p></section> -->
+<section id="cpu" class="sheet">
+  <div class="sheet-top"><div><h2>CPU</h2><div class="model">{{MODEL · cores/threads}}</div></div><span class="pill">{{SCORE}}% · optimal</span></div>
+  <p class="lede">{{2-3 PLAIN-ENGLISH SENTENCES: how it performed vs spec, what limited it (power or heat), how hot it got, how fast it recovered}}</p>
+  <div class="stats">
+    <div class="stat"><span class="k">Power under load</span><span class="v">{{AVG}} W</span><span class="s">avg · {{MAX}} W max (limit {{LIMIT}} W)</span></div>
+    <div class="stat"><span class="k">Peak temperature</span><span class="v">{{PEAK}} °C</span><span class="s">limit {{TJMAX}} °C · {{N}} throttle events</span></div>
+    <div class="stat"><span class="k">Clock, all cores</span><span class="v">{{GHZ}}</span><span class="s">{{NOTE e.g. fast / efficient cores}}</span></div>
+    <div class="stat"><span class="k">Single-core boost</span><span class="v">{{GHZ}}</span><span class="s">{{PCT}}% of max</span></div>
+  </div>
+  <div class="gauge" role="img" aria-label="CPU scores as % of expected">
+    <!-- REPEAT per main score: fill = pct/120*100 % (cap 100%), class warn/fail on .g-row when below ~90% / failing -->
+    <div class="g-row"><span class="t">{{TEST NAME}}</span><div class="g-track"><div class="g-fill" style="width:{{PCT/120*100}}%"></div><div class="g-ref" style="left:83.33%"></div></div><span class="p">{{PCT}}%</span></div>
+    <div class="g-scale"><span class="lead"></span><div class="ticks"><span style="left:0">0</span><span style="left:41.67%">50</span><span style="left:83.33%">100%</span></div><span></span></div>
+  </div>
+  <div class="takeaway">
+    <div><h3>What it means</h3>{{1-2 SENTENCES}}</div>
+    <div><h3>Recommendation</h3>{{1-2 SENTENCES}}</div>
+  </div>
+  <details><summary>All CPU scores</summary><div class="tbl"><table>
+    <tr><th>Test</th><th>Result</th><th>Reference</th><th>% of expected</th></tr>
+    <!-- REPEAT rows -->
+    <tr><td>{{TEST}}</td><td class="n">{{RESULT}}</td><td>{{REFERENCE + source}}</td><td class="n">{{PCT}}%</td></tr>
+  </table></div></details>
+</section>
+
+<section id="todo">
+  <div class="sec-head"><h2>What to do next</h2><span class="eyebrow">{{e.g. None urgent}}</span></div>
+  <div class="recs">
+    <!-- REPEAT, most important first. tag: <span class="tag do">recommended</span> or <span class="tag opt">optional</span> -->
+    <div class="rec"><div><strong>{{RECOMMENDATION TITLE}} <span class="tag do">recommended</span></strong><p>{{WHY, 1-2 SENTENCES}}</p></div></div>
+  </div>
+</section>
+
+<section id="limits">
+  <div class="sec-head"><h2>Limits of these tests</h2></div>
+  <div class="limits">
+    <div><strong>{{DURATION}} per part is a snapshot</strong>{{e.g. It proves full speed and stability under load; hours-long stability needs a longer burn-in.}}</div>
+    <div><strong>Partial RAM coverage</strong>{{e.g. X of Y GB was checked; only an overnight memtest86+ covers it all.}}</div>
+    <div><strong>File-based disk tests</strong>{{e.g. Test files only, so no data was at risk.}}</div>
+    <div><strong>No wall-power meter</strong>{{e.g. CPU/GPU power from their own sensors; disks have none.}}</div>
+  </div>
+</section>
+
+<footer>
+  <span>Tools: {{TOOLS USED}}. {{CLEANUP NOTE e.g. All were removed after the run, and no settings were changed.}}</span>
+  <span>Generated by the proxmox-hardware-stress-test skill · Markdown report and raw logs: <code>{{RUN FOLDER}}</code></span>
+</footer>
+
+</div>
+</body>
+</html>

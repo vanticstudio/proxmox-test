@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Lint, privacy scan and dist check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck zip unzip
+
+      - name: Bash syntax check (bash -n)
+        run: |
+          status=0
+          while IFS= read -r -d '' f; do
+            echo "bash -n $f"
+            bash -n "$f" || status=1
+          done < <(find . -path ./.git -prune -o -type f -name '*.sh' -print0)
+          exit $status
+
+      - name: ShellCheck (errors only)
+        run: |
+          find . -path ./.git -prune -o -type f -name '*.sh' -print0 \
+            | xargs -0 -r shellcheck --severity=error
+
+      - name: Python compile check
+        run: |
+          find . -path ./.git -prune -o -type f -name '*.py' -print0 \
+            | xargs -0 -r python3 -m py_compile
+          find . -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+      - name: Privacy scan (IPs, emails, home paths)
+        run: |
+          python3 - <<'PY'
+          import ipaddress, os, re, sys
+
+          # Only documentation ranges (RFC 5737) and these two addresses are OK.
+          ALLOWED_NETS = [ipaddress.ip_network(n) for n in
+                          ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")]
+          ALLOWED_ADDRS = {"127.0.0.1", "0.0.0.0"}
+          # Example domains that may appear in placeholder email addresses.
+          ALLOWED_EMAIL_DOMAINS = {"example.com", "example.org", "example.net",
+                                   "users.noreply.github.com"}
+
+          IPV4 = re.compile(r"(?<![\w.])((?:\d{1,3}\.){3}\d{1,3})(?![\w.])")
+          # A version string glued to a product name, e.g. Chrome/126.0.0.0
+          VERSION_PREFIX = re.compile(r"[A-Za-z][\w.-]*/$")
+          EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})")
+          HOME = re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+")
+
+          SKIP_DIRS = {".git", "dist", "node_modules", "__pycache__"}
+          SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf",
+                      ".zip", ".skill", ".woff", ".woff2"}
+          SELF = os.path.join(".github", "workflows", "ci.yml")
+
+          problems = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+              for name in files:
+                  path = os.path.normpath(os.path.join(root, name))
+                  if os.path.splitext(name)[1].lower() in SKIP_EXT:
+                      continue
+                  try:
+                      with open(path, encoding="utf-8") as fh:
+                          lines = fh.readlines()
+                  except (UnicodeDecodeError, OSError):
+                      continue
+                  for no, line in enumerate(lines, 1):
+                      for m in IPV4.finditer(line):
+                          ip = m.group(1)
+                          if VERSION_PREFIX.search(line[:m.start()]):
+                              continue  # e.g. User-Agent "Chrome/126.0.0.0"
+                          try:
+                              addr = ipaddress.ip_address(ip)
+                          except ValueError:
+                              continue  # not a real address (octet > 255)
+                          if ip in ALLOWED_ADDRS or any(addr in n for n in ALLOWED_NETS):
+                              continue
+                          problems.append(f"{path}:{no}: IPv4 address {ip} "
+                                          "(use 192.0.2.x, 198.51.100.x or 203.0.113.x)")
+                      for m in EMAIL.finditer(line):
+                          if m.group(1).lower() in ALLOWED_EMAIL_DOMAINS:
+                              continue
+                          problems.append(f"{path}:{no}: email address {m.group(0)}")
+                      if path != SELF:
+                          for m in HOME.finditer(line):
+                              problems.append(f"{path}:{no}: personal path {m.group(0)}")
+
+          if problems:
+              print("Possible personal data found. Replace it with a placeholder:\n")
+              print("\n".join(problems))
+              sys.exit(1)
+          print("Privacy scan: no personal data patterns found.")
+          PY
+
+      - name: Check dist/ matches the skill folder
+        run: |
+          chmod +x tools/build.sh
+          tools/build.sh --check

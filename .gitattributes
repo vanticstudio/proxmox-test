@@ -1,0 +1,15 @@
+# Normalise line endings so scripts run on the Proxmox host (Linux) unchanged.
+* text=auto
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.c     text eol=lf
+*.md    text eol=lf
+*.html  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+SHA256SUMS text eol=lf
+
+# Packaged skill archives: never diff or convert.
+*.skill binary
+*.zip   binary
