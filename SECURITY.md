@@ -22,7 +22,8 @@ This skill runs as **root** on a Proxmox VE host that holds your VMs, containers
 | CPU, RAM, GPU | Loaded to 100% one part at a time. The RAM test uses at most about 40% of available memory and always leaves at least 4 GiB plus your guests' headroom free; a watchdog stops it if memory runs low. |
 | Disks with their own filesystem | One temporary test file per disk (see below), then deleted. |
 | Disks without one (ZFS / Ceph / mdraid members, LVM-only, RAID volumes) | **Read only**, with `fio --readonly` on the device. |
-| apt packages | Test tools installed from the host's own configured repos, recorded, and removed at the end. |
+| apt packages | Test tools installed from the host's own configured repos, recorded, and removed at the end. For AMD and Intel GPUs this includes a userland OpenCL runtime (e.g. `mesa-opencl-icd`, `intel-opencl-icd`); each is simulated first and skipped if apt would also install a kernel, firmware, DKMS or microcode package or upgrade anything already installed. |
+| GPUs (NVIDIA, AMD, Intel; discrete and integrated) | Loaded through OpenCL only, one GPU at a time. On AMD/Intel only that GPU's own OpenCL runtime is made visible to the tools. GPUs shared with containers are tested with a warning; GPUs bound to `vfio-pci` are never touched. |
 
 On **your computer** it writes only the copied logs and the three reports (Markdown, HTML, PDF) into a local folder, and a small temporary SSH wrapper script that is deleted at the end.
 
@@ -33,8 +34,8 @@ On **your computer** it writes only the copied logs and the three reports (Markd
 - **Never changes RAID controller or HBA settings**, rebuilds arrays or runs controller self-tests. Only read-only queries are used.
 - **Never changes BIOS, power limits, CPU governors, fan curves, GPU clocks / power limits or kernel parameters.** The point is to measure the box as it really runs; suggested changes go in the report as recommendations.
 - **Never starts, stops, migrates, snapshots or reconfigures guests**, and never touches a GPU bound to `vfio-pci` (passed through to a VM).
-- **Never runs two parts at once**, and stops to ask you if hardware errors appear (machine-check / EDAC, RAM miscompares, GPU Xid, rising SMART counters, kernel I/O errors).
-- **Never installs from anywhere but your host's configured apt repos.**
+- **Never runs two parts at once**, and stops to ask you if hardware errors appear (machine-check / EDAC, RAM miscompares, GPU Xid or AMD/Intel GPU hangs and resets, rising SMART counters, kernel I/O errors).
+- **Never installs from anywhere but your host's configured apt repos**, and never installs or removes GPU drivers, kernel modules, DKMS packages, kernels or firmware (the AMD and Intel drivers are already in the Proxmox kernel; only userland OpenCL runtimes are added).
 
 Disks that need extra care (failing SMART, USB-attached, the raw disk of a stopped VM) are asked about one by one, and are not tested without a clear yes.
 
@@ -75,5 +76,6 @@ Please don't open a public issue for safety problems until a fix is out. You'll 
 
 | Version | Supported |
 |---|---|
-| 1.0.x | Yes |
+| 1.1.x | Yes |
+| 1.0.x | Yes (upgrade for AMD / Intel GPU support) |
 | Older | No |

@@ -32,11 +32,11 @@ A score only means something next to a trustworthy reference. This file explains
 | CPU package power under load | Intel PL1/PL2 (BIOS / `rapl-limits.txt`); AMD PPT (88 W for 65 W TDP parts, 142 W for 105 W AM4/AM5, 162 W for 120 W AM5, 230 W for 170 W AM5) |
 | RAM bandwidth (STREAM, stress-ng stream, sysbench 1T) | Theoretical max (section 3) and the typical ranges in 4.2 |
 | RAM latency (`latency.c`, 4 GB buffer, random pointer chase) | Typical ranges in 4.2. Review sites (AIDA64 latency) are 5-15 ns lower than this method because AIDA uses large pages / a different pattern |
-| GPU hashcat speeds | hashcat forum / GitHub benchmark gists for the same card and a recent hashcat version. OpenCL vs CUDA backends differ by a few %; this skill uses OpenCL |
-| GPU FP32 TFLOPS, VRAM GB/s | Spec sheet / TechPowerUp GPU database (boost-clock FP32). clpeak typically lands around 90-110% of spec FP32 (cards often boost above the rated clock) and around 80-95% of spec bandwidth |
+| GPU hashcat speeds | hashcat forum / GitHub benchmark gists for the same card and a recent hashcat version. OpenCL vs CUDA backends differ by a few %; this skill uses OpenCL. On AMD/Intel, match the OpenCL runtime too (rusticl / Clover vs ROCm / compute-runtime differ a lot) |
+| GPU FP32 TFLOPS, VRAM GB/s | Spec sheet / TechPowerUp GPU database (boost-clock FP32). clpeak typically lands around 90-110% of spec FP32 (cards often boost above the rated clock) and around 80-95% of spec bandwidth. Integrated GPUs: compare bandwidth with the RAM (section 4.3, AMD and Intel) |
 | SSD seq MB/s, 4K IOPS | Manufacturer datasheet for that capacity. QD1 4K read is rarely published: use the class values in 4.4 |
 | HDD MB/s | Datasheet "max sustained transfer rate" (outer tracks). Inner tracks are ~50-60% of it |
-| Temperatures | CPU TjMax (Intel ARK, typically 100 °C; AMD Tjmax 90-95 °C), GPU slowdown temp (`nvidia-smi -q`), NVMe warning temp (`smartctl` "Warning Comp. Temp. Threshold"), HDD max operating temp (datasheet, usually 60-65 °C) |
+| Temperatures | CPU TjMax (Intel ARK, typically 100 °C; AMD Tjmax 90-95 °C), GPU slowdown temp (`nvidia-smi -q`; AMD: hwmon `temp*_crit` for edge / junction, junction usually up to ~110 °C on RDNA; Intel iGPUs share the CPU TjMax), NVMe warning temp (`smartctl` "Warning Comp. Temp. Threshold"), HDD max operating temp (datasheet, usually 60-65 °C) |
 
 ## 3. Theoretical maxima
 
@@ -89,6 +89,8 @@ Typical pattern: a dual-channel DDR5 desktop usually reaches roughly 75-90% of t
 
 ### 4.3 GPUs
 
+#### NVIDIA GPUs
+
 | GPU | FP32 (spec, TFLOPS) | VRAM bandwidth (GB/s) | hashcat MD5 / NTLM / SHA-256 / WPA (published) |
 |---|---|---|---|
 | NVIDIA RTX 3060 12 GB | 12.74 | 360 | look up |
@@ -103,10 +105,51 @@ Typical pattern: a dual-channel DDR5 desktop usually reaches roughly 75-90% of t
 | NVIDIA Tesla P40 | 11.76 | 347 | look up |
 | NVIDIA Tesla P4 | 5.5 | 192 | look up |
 | NVIDIA Quadro P2000 | 3.0 | 140 | look up |
-| AMD RX 6600 | 8.93 | 224 | look up (OpenCL support on the host is often missing) |
-| AMD RX 6700 XT | 13.21 | 384 | look up (as above) |
 
 Typical: clpeak FP32 around 90-110% of spec (cards often boost past the rated clock), VRAM bandwidth ~80-95% of theoretical, FP64 ~1/64 of FP32 on GeForce, PCIe Gen4 x16 transfer ~16-19 GB/s.
+
+#### AMD and Intel GPUs (discrete and integrated)
+
+FP32 and memory bandwidth are spec-sheet figures (vendor pages / TechPowerUp GPU database, boost clock). The hashcat MD5 (`-m 0`) column is an **approximate order of magnitude** from published community benchmarks on the vendors' own runtimes (ROCm / Windows drivers / Intel compute-runtime); it varies with hashcat version and clocks. Use it to spot a result that is wildly off, not as a pass/fail gate, and look up a newer figure for the exact card when you can.
+
+| GPU | FP32 (spec, TFLOPS) | Memory bandwidth (GB/s) | hashcat MD5 (GH/s, approx.) |
+|---|---|---|---|
+| **AMD discrete** | | | |
+| AMD RX 580 8 GB | 6.2 | 256 | ~8-10 |
+| AMD RX 5700 XT | 9.75 | 448 | ~18-22 |
+| AMD RX 6600 | 8.93 | 224 | ~14-17 |
+| AMD RX 6600 XT | 10.6 | 256 | ~17-20 |
+| AMD RX 6700 XT | 13.21 | 384 | ~24-28 |
+| AMD RX 6800 | 16.2 | 512 | ~34-40 |
+| AMD RX 7600 | 21.5 | 288 | ~22-26 |
+| AMD RX 7800 XT | 37.3 | 624 | ~45-55 |
+| AMD RX 7900 XTX | 61.4 | 960 | ~90-110 |
+| AMD Radeon Pro W6600 | 10.4 | 224 | ~16-19 |
+| AMD Radeon Pro W7600 | 20.0 | 288 | ~22-26 |
+| **AMD APU (integrated)** | | | |
+| Radeon 680M (RDNA2, 12 CU) | ~3.7 | shared LPDDR5 (~77) | ~5-7 |
+| Radeon 780M (RDNA3, 12 CU) | ~8.6 | shared LPDDR5 (~90) | ~8-11 |
+| Radeon Vega 8 (Ryzen 2000/3000G) | ~1.8 | shared DDR4 | ~2-3 |
+| Radeon Vega 11 (Ryzen 5 2400G) | ~2.1 | shared DDR4 | ~2.5-3.5 |
+| **Intel Arc (discrete)** | | | |
+| Intel Arc A310 | 3.5 | 96 | ~4-6 |
+| Intel Arc A380 | 4.2 | 186 | ~6-8 |
+| Intel Arc A750 | 17.2 | 512 | ~20-26 |
+| Intel Arc A770 16 GB | 19.7 | 560 | ~24-30 |
+| Intel Arc B580 | ~29 | 456 | ~30-38 |
+| **Intel integrated** | | | |
+| Intel UHD 630 (Gen9.5) | ~0.4 | shared DDR4 | ~0.5-1 |
+| Intel UHD 730 (Gen12, 24 EU) | ~0.7 | shared DDR4/DDR5 | ~1-1.5 |
+| Intel UHD 770 (Gen12, 32 EU) | ~0.8 | shared DDR5 | ~1.5-2 |
+| Intel Iris Xe (Gen12, 96 EU) | ~2.1 | shared LPDDR4x/LPDDR5 | ~2.5-3.5 |
+| Intel N100 UHD (Gen12, 24 EU) | ~0.7 | shared LPDDR5 / DDR4/5 (single channel, ~38) | ~1-1.5 |
+
+How to judge AMD/Intel results:
+- **Runtime matters.** `gpu.sh` records which OpenCL runtime it used (`summary.json` `.opencl.platform`): Mesa **rusticl**, Mesa **Clover**, Intel **compute-runtime** or AMD **ROCm**. Mesa rusticl usually reaches clpeak FP32 close to spec, but hashcat speeds on rusticl and Clover can be well below the ROCm / Windows figures that most published hashcat numbers come from. If the runtime differs from the reference's, say so and lean on clpeak FP32 / bandwidth for the part score; score hashcat only against a reference from the same runtime, or show it unscored.
+- **Integrated GPUs (iGPU / APU) have no VRAM.** They use system RAM, so "memory bandwidth" is shared with the CPU: compare clpeak's global-memory bandwidth with the RAM's measured STREAM result (`02-ram`), not with a VRAM spec. A good iGPU result is roughly 60-90% of the RAM's STREAM figure. The `shared ...` entries above are the theoretical RAM bandwidth of a typical configuration; use the host's real channel count and speed (section 3).
+- **Power on integrated GPUs is not a GPU-only figure.** Intel iGPUs report the RAPL "uncore" domain (GPU plus some uncore logic) when the CPU exposes it; AMD APUs report the whole APU package (CPU + GPU). Say "shared with the CPU" and don't compare it with a discrete card's board power.
+- **Throttling:** AMD and Intel give no NVIDIA-style throttle-reason bitmask. Use `stress.stats.clock_vs_max_pct` (average core clock under load vs the GPU's max) together with temperature: a clock far below max with temperature at the limit is thermal throttling; a clock below max at moderate temperature on an iGPU is usually the shared package power limit (normal). Intel reports active throttle reasons (`throttle` column, e.g. `pl1`, `thermal`).
+- **FP64:** consumer RDNA cards are ~1/16-1/32 of FP32; Intel Arc and Gen12 iGPUs have no native FP64 (clpeak may skip it or emulate it). Don't score FP64.
 
 ### 4.4 SSDs
 

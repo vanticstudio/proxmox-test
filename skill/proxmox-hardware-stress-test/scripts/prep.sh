@@ -17,12 +17,20 @@
 #                         apt update, no idle baseline, no load. Writes
 #                         hardware.json, inventory.json/.md, plan.json/.md and
 #                         prints the plan; run this first and show it to the user.
-#   --gpu-tools MODE      auto (default): install OpenCL GPU tools only when an
-#                         NVIDIA GPU is driven by the host's nvidia driver;
-#                         yes: same set even if no usable GPU; no: never.
-#   --amd-intel-opencl    Opt-in: for AMD/Intel GPUs also install Mesa OpenCL
-#                         (rusticl, mesa-opencl-icd) + clinfo/clpeak/hashcat.
-#                         Unofficial and often slow / unsupported; off by default.
+#   --gpu-tools MODE      auto (default): install the GPU test tools for every GPU
+#                         the host drives itself: NVIDIA (nvidia driver) ->
+#                         hashcat ocl-icd-libopencl1 clinfo clpeak; AMD (amdgpu)
+#                         and Intel (i915/xe), discrete or integrated -> the same
+#                         plus the right userland OpenCL runtime for the Debian
+#                         release and GPU generation (Mesa rusticl via
+#                         mesa-opencl-icd, Intel compute-runtime via
+#                         intel-opencl-icd where packaged, AMD radeonsi from
+#                         <codename>-backports on Debian 12 when that suite is
+#                         configured) and intel-gpu-tools for Intel busy %.
+#                         yes: as auto, plus the NVIDIA set even without a usable
+#                         GPU; no: never install GPU tools.
+#   --amd-intel-opencl    Accepted for compatibility; no effect (AMD/Intel
+#                         OpenCL is now part of --gpu-tools auto).
 #
 # What it does
 #   1. Detects hardware -> DIR/hardware.json: CPU (vendor/model/cores/threads/
@@ -46,10 +54,18 @@
 #   2. Installs the test tools from the configured Debian/Proxmox apt repos
 #      only (stress-ng sysbench 7-zip fio nvme-cli smartmontools lm-sensors
 #      linux-cpupower dmidecode pciutils memtester gcc libc6-dev python3, plus
-#      hashcat ocl-icd-libopencl1 clinfo clpeak for an NVIDIA GPU). Packages
-#      that were NOT installed before (dependencies included) are appended to
+#      hashcat ocl-icd-libopencl1 clinfo clpeak for a GPU, plus the AMD/Intel
+#      OpenCL runtime packages, see --gpu-tools). Packages that were NOT
+#      installed before (dependencies included) are appended to
 #      DIR/installed-packages.txt so cleanup.sh removes exactly those.
-#      Never installs or touches GPU drivers, kernels or firmware.
+#      Never installs or touches GPU drivers, kernel modules, DKMS, kernels or
+#      firmware. Each AMD/Intel runtime package is first simulated (apt-get -s):
+#      it is NOT installed if apt would pull a kernel/firmware/DKMS/microcode
+#      package or upgrade a package already on the host (cleanup could not undo
+#      that); the GPU is then "limited" with that reason in the plan. Per GPU,
+#      hardware.json records "integrated", "render_node" and "opencl" (runtime,
+#      packages, state: present / will-install / installed / unavailable /
+#      blocked / failed / unsupported / not-installed, note).
 #   3. Baseline in DIR/00-baseline/: idle telemetry (1 Hz CSV: CPU W / C / MHz /
 #      busy %, RAM, every GPU, every disk temp + I/O), SMART snapshots of every
 #      disk, RAPL limits, governor, sensors, dmidecode, hardware error counters
@@ -62,6 +78,11 @@
 # Time: ~1-3 min for apt (first run), + baseline-seconds (30 s) + ~10-20 s of
 # snapshots. Exit 0 on success (missing sensors/tools are recorded, not fatal);
 # exit 1 only for bad usage, not root, or unwritable DIR.
+#
+# Developer-only: PVE_STRESS_SYSFS_ROOT=DIR (via telemetry.sh's TEL_ROOT) makes the
+# GPU detection and OpenCL checks read DIR/sys, DIR/etc/OpenCL/vendors and
+# DIR/etc/os-release instead of the real files. Never set it on a real host;
+# see docs/developing.md.
 # =============================================================================
 set -u
 set -o pipefail
@@ -72,7 +93,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 OUT="" DURATION="" BASE_S=30 DO_INSTALL=1 GPU_TOOLS=auto AMD_OPENCL=0 PLAN_ONLY=0
 
-usage() { sed -n '4,26p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '4,33p' "$0" | sed 's/^# \{0,1\}//'; }
 need_arg() { [[ $# -ge 2 && -n ${2:-} ]] || { echo "Missing value for $1" >&2; usage >&2; exit 1; }; }
 
 while (($#)); do
@@ -83,7 +104,7 @@ while (($#)); do
         --no-install) DO_INSTALL=0; shift ;;
         --plan-only) PLAN_ONLY=1; DO_INSTALL=0; shift ;;
         --gpu-tools) need_arg "$@"; GPU_TOOLS=$2; shift 2 ;;
-        --amd-intel-opencl) AMD_OPENCL=1; shift ;;
+        --amd-intel-opencl) AMD_OPENCL=1; shift ;;   # compatibility alias: no effect any more
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -110,8 +131,9 @@ tel_log "prep: output in $OUT$( ((PLAN_ONLY)) && echo ' (plan only: no installs,
 
 # ============================================================================ 1. GPU detection via sysfs (no tools needed)
 GPU_SLOTS=() GPU_VEND=() GPU_DEVID=() GPU_DRV=() GPU_KIND=() GPU_TESTABLE=() GPU_REASON=() GPU_NAME=()
+GPU_INTEG=() GPU_RNODE=() GPU_OCL_RT=() GPU_OCL_STATE=() GPU_OCL_PKGS=() GPU_OCL_BPO=() GPU_OCL_NOTE=()
 NVIDIA_USABLE=0 AMDINTEL_PRESENT=0
-for dev in /sys/bus/pci/devices/*; do
+for dev in "$TEL_ROOT"/sys/bus/pci/devices/*; do
     cls=$(_tel_read "$dev/class") || continue
     [[ $cls == 0x03* ]] || continue
     slot=${dev##*/}
@@ -137,14 +159,15 @@ for dev in /sys/bus/pci/devices/*; do
         0x1002) kind=amd
             case $drv in
                 amdgpu) testable=limited; AMDINTEL_PRESENT=1
-                    reason="telemetry via sysfs; OpenCL only with --amd-intel-opencl (Mesa rusticl, unofficial) or a ROCm install the user manages" ;;
+                    reason="OpenCL runtime not checked yet" ;;   # decided by plan_amd_intel_runtimes below
+                radeon) reason="legacy radeon driver (pre-GCN card) - no OpenCL runtime for it; not usable for compute" ;;
                 vfio-pci) reason="passed through to a VM (vfio-pci) - cannot be tested from the host" ;;
                 *) reason="driver ${drv:-none} - not usable for compute" ;;
             esac ;;
         0x8086) kind=intel
             case $drv in
                 i915|xe) testable=limited; AMDINTEL_PRESENT=1
-                    reason="telemetry via sysfs (clock/temp only); OpenCL only with --amd-intel-opencl (Mesa rusticl, unofficial)" ;;
+                    reason="OpenCL runtime not checked yet" ;;   # decided by plan_amd_intel_runtimes below
                 vfio-pci) reason="passed through to a VM (vfio-pci) - cannot be tested from the host" ;;
                 *) reason="driver ${drv:-none} - not usable for compute" ;;
             esac ;;
@@ -153,6 +176,9 @@ for dev in /sys/bus/pci/devices/*; do
     esac
     GPU_SLOTS+=("$slot"); GPU_VEND+=("$v"); GPU_DEVID+=("$did"); GPU_DRV+=("${drv:-none}")
     GPU_KIND+=("$kind"); GPU_TESTABLE+=("$testable"); GPU_REASON+=("$reason"); GPU_NAME+=("${name:-unknown}")
+    rn=""; for r in "$dev"/drm/renderD[0-9]*; do [[ -e $r ]] && { rn=${r##*/}; break; }; done
+    GPU_INTEG+=("$(gpu_is_integrated_pci "$slot" "$name")"); GPU_RNODE+=("$rn")
+    GPU_OCL_RT+=(""); GPU_OCL_STATE+=("not-applicable"); GPU_OCL_PKGS+=(""); GPU_OCL_BPO+=(0); GPU_OCL_NOTE+=("")
 done
 tel_log "GPUs found: ${#GPU_SLOTS[@]} (NVIDIA usable from host: $NVIDIA_USABLE)"
 
@@ -161,19 +187,7 @@ tel_log "GPUs found: ${#GPU_SLOTS[@]} (NVIDIA usable from host: $NVIDIA_USABLE)"
 REQ=(stress-ng sysbench fio nvme-cli smartmontools lm-sensors linux-cpupower dmidecode pciutils memtester gcc libc6-dev python3)
 SEVENZ_ALT=()
 command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1 || SEVENZ_ALT=(p7zip-full 7zip)
-GPU_PKGS=()
-if [[ $GPU_TOOLS == yes ]] || [[ $GPU_TOOLS == auto && $NVIDIA_USABLE == 1 ]]; then
-    # Note: Debian's hashcat has a hard "Depends: pocl-opencl-icd | opencl-icd". The NVIDIA
-    # .run installer provides the ICD file but no package, so apt pulls in pocl (a CPU
-    # OpenCL runtime) plus several LLVM/SPIR-V libraries even with --no-install-recommends.
-    # They are recorded and removed by cleanup.sh; gpu.sh never benchmarks the pocl device.
-    GPU_PKGS+=(hashcat ocl-icd-libopencl1 clinfo clpeak)
-fi
-if [[ $GPU_TOOLS != no && $AMD_OPENCL == 1 && $AMDINTEL_PRESENT == 1 ]]; then
-    GPU_PKGS+=(mesa-opencl-icd ocl-icd-libopencl1 clinfo clpeak hashcat)
-fi
-
-PKG_ALREADY=() PKG_NEW_REQ=() PKG_UNAVAIL=() PKG_FAILED=() NEWLY=()
+PKG_ALREADY=() PKG_NEW_REQ=() PKG_UNAVAIL=() PKG_FAILED=() NEWLY=() PKG_BLOCKED=() BPO_NEW=()
 APT_UPDATE_OK=na
 pkg_installed() { [[ $(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null) == ii* ]]; }
 pkg_candidate() {
@@ -181,10 +195,163 @@ pkg_candidate() {
     c=$(apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{print $2; exit}')
     [[ -n $c && $c != "(none)" ]]
 }
+pkg_cand_ver() { apt-cache policy "$1" 2>/dev/null | awk '/Candidate:/{ if ($2 != "(none)") print $2; exit}'; }
+pkg_inst_ver() { pkg_installed "$1" && dpkg-query -W -f='${Version}' "$1" 2>/dev/null; }
+# Newest version of $1 offered by a *-backports suite that is configured on the host (or empty).
+pkg_bpo_ver() { apt-cache madison "$1" 2>/dev/null | awk -F'|' '$3 ~ /-backports/ { gsub(/ /,"",$2); print $2; exit }'; }
+ver_ge() { [[ -n ${1:-} && -n ${2:-} ]] && dpkg --compare-versions "$1" ge "$2" 2>/dev/null; }
+icd_present() { compgen -G "$TEL_ROOT/etc/OpenCL/vendors/$1" >/dev/null 2>&1; }
+DEB_CODENAME=$( (. "$TEL_ROOT/etc/os-release" 2>/dev/null; printf '%s' "${VERSION_CODENAME:-}") )
+
+# Intel GPUs older than Gen8 (Sandy/Ivy Bridge, Haswell, Bay Trail and earlier) use the crocus/i965
+# Mesa drivers: neither rusticl nor Intel's compute-runtime supports them.
+intel_pre_gen8() {
+    case ${1,,} in
+        0x01??|0x04??|0x0a??|0x0c??|0x0d??|0x0f??|0x29??|0x2a??|0x2e??|0xa0??|0x0042|0x0046) return 0 ;;
+    esac
+    return 1
+}
+
+# Simulate installing ONE package (+ its dependencies). Refuse when apt would pull a
+# kernel / firmware / DKMS / microcode / bootloader package, or upgrade a package that is
+# already installed (cleanup.sh removes only new packages, so an upgrade could not be undone).
+declare -A SIMC=()     # package simulation verdicts: "ok" or the reason it is blocked
+NOKERNEL_RE='^(linux-(image|headers|modules|kbuild|support)|proxmox-kernel|proxmox-default-kernel|proxmox-headers|proxmox-default-headers|pve-kernel|pve-headers|pve-firmware|firmware-.*|.*-dkms|dkms|amd64-microcode|intel-microcode|grub.*|shim.*)'
+SIM_REASON=""
+sim_ok() {
+    local out bad up
+    SIM_REASON=""
+    out=$(LC_ALL=C apt-get -s -q install --no-install-recommends "$@" 2>&1) || {
+        SIM_REASON="apt cannot install it: $(grep -m1 -E '^E:' <<<"$out" | cut -c1-160)"; return 1; }
+    bad=$(awk '$1=="Inst"{print $2}' <<<"$out" | grep -E "$NOKERNEL_RE" | tr '\n' ' ')
+    [[ -n $bad ]] && { SIM_REASON="apt would also install kernel/firmware/DKMS packages (${bad% }), which this skill never does"; return 1; }
+    up=$(awk '$1=="Inst" && $3 ~ /^\[/{print $2}' <<<"$out" | tr '\n' ' ')
+    [[ -n $up ]] && { SIM_REASON="apt would upgrade packages already on the host (${up% }), which cleanup could not undo; update the host first (apt full-upgrade) or install the runtime yourself"; return 1; }
+    return 0
+}
+
+# Decide, per AMD (amdgpu) / Intel (i915, xe) GPU, which userland OpenCL runtime makes it
+# testable, and which packages that needs. Sets GPU_OCL_* and GPU_TESTABLE/GPU_REASON, and
+# appends to GPU_PKGS / GPU_BPO_PKGS. MODE: plan (nothing installed yet) | final (after apt).
+plan_amd_intel_runtimes() {
+    local mode=${1:-plan} i k drv did rt st pk bpo note mi mc mb ni nc need nmesa why p key okp got
+    mi=$(pkg_inst_ver mesa-opencl-icd); mc=$(pkg_cand_ver mesa-opencl-icd); mb=$(pkg_bpo_ver mesa-opencl-icd)
+    ni=$(pkg_inst_ver intel-opencl-icd); nc=$(pkg_cand_ver intel-opencl-icd)
+    AMDINTEL_WANTS_TOOLS=0
+    for i in "${!GPU_SLOTS[@]}"; do
+        k=${GPU_KIND[$i]} drv=${GPU_DRV[$i]} did=${GPU_DEVID[$i]}
+        case "$k:$drv" in amd:amdgpu|intel:i915|intel:xe) ;; *) continue ;; esac
+        rt="" st="" pk="" bpo=0 note="" why=""
+        if [[ $k == amd ]]; then
+            need="23.1~"   # rusticl's radeonsi backend arrived in Mesa 23.1
+            if icd_present 'amdocl*.icd'; then rt="AMD ROCm OpenCL (already installed)"; st=present
+            elif ver_ge "$mi" "$need"; then rt="Mesa rusticl (radeonsi), mesa-opencl-icd $mi"; st=present
+            elif ver_ge "$mc" "$need"; then rt="Mesa rusticl (radeonsi), mesa-opencl-icd $mc"; st=install; pk=mesa-opencl-icd
+            elif ver_ge "$mb" "$need"; then rt="Mesa rusticl (radeonsi), mesa-opencl-icd $mb from ${DEB_CODENAME:-?}-backports"; st=install; pk=mesa-opencl-icd; bpo=1
+            elif [[ -n $mi || -n $mc ]]; then
+                rt="Mesa Clover (legacy OpenCL 1.1) only"; st=$([[ -n $mi ]] && echo present || echo install); [[ -z $mi ]] && pk=mesa-opencl-icd
+                note="Mesa ${mi:-$mc} has no rusticl support for AMD (needs Mesa 23.1+; on Debian 12 add ${DEB_CODENAME:-bookworm}-backports to the host's apt sources); only the legacy Clover runtime is available, which hashcat usually rejects - clpeak may still run"
+            else st=unavailable; why="no AMD OpenCL runtime package (mesa-opencl-icd) in the host's configured apt repos; telemetry only"
+            fi
+        else
+            if intel_pre_gen8 "$did"; then
+                st=unsupported; why="Intel GPU generation 7 or older (device $did): no rusticl or compute-runtime OpenCL support; telemetry only"
+            else
+                need="22.3~"; [[ $drv == xe ]] && need="24.1~"   # iris on the xe kernel driver needs Mesa 24.1+
+                nmesa=""
+                if icd_present 'intel*.icd' || [[ -n $ni ]]; then rt="Intel compute-runtime (already installed)"; st=present
+                elif [[ $drv == i915 && -n $nc ]]; then rt="Intel compute-runtime (intel-opencl-icd $nc)"; st=install; pk=intel-opencl-icd
+                fi
+                if ver_ge "$mi" "$need"; then nmesa="Mesa rusticl (iris), mesa-opencl-icd $mi"; [[ -z $st ]] && st=present
+                elif ver_ge "$mc" "$need"; then nmesa="Mesa rusticl (iris), mesa-opencl-icd $mc"; pk="${pk:+$pk }mesa-opencl-icd"; [[ -z $st ]] && st=install
+                elif ver_ge "$mb" "$need"; then nmesa="Mesa rusticl (iris), mesa-opencl-icd $mb from ${DEB_CODENAME:-?}-backports"; pk="${pk:+$pk }mesa-opencl-icd"; bpo=1; [[ -z $st ]] && st=install
+                fi
+                rt="${rt}${rt:+${nmesa:+; fallback }}${nmesa}"
+                # a working runtime is already there: install nothing (and don't name a Mesa that isn't installed)
+                [[ $st == present ]] && { pk=""; bpo=0; [[ -z $mi ]] && rt=${rt%%; fallback*}; }
+                if [[ -z $st ]]; then
+                    st=unavailable
+                    if [[ $drv == xe && -n $nc ]]; then nmesa="intel-opencl-icd $nc is offered but this skill only uses it with the i915 driver"
+                    else nmesa="intel-opencl-icd is not available from them (it is not packaged for Debian 13)"; fi
+                    why="no Intel OpenCL runtime package for this GPU in the host's configured apt repos (rusticl iris needs mesa-opencl-icd >= ${need%\~}; $nmesa); telemetry only"
+                fi
+            fi
+        fi
+        # GPU tools disabled, or no installs in this run
+        if [[ $st == install && $GPU_TOOLS == no ]]; then st=not-installed; why="OpenCL runtime ($rt) not installed: --gpu-tools no"
+        elif [[ $st == install ]] && ((!DO_INSTALL && !PLAN_ONLY)); then st=not-installed; why="OpenCL runtime ($rt) not installed: --no-install"
+        fi
+        # Simulate each package once (read-only, so also in plan-only mode); the final pass
+        # reuses the verdicts so a blocked package is reported as blocked, not as failed.
+        if [[ $st == install ]]; then
+            okp=""
+            for p in $pk; do
+                key=$p.$bpo
+                if [[ -z ${SIMC[$key]:-} ]]; then
+                    if [[ $mode != plan ]]; then SIMC[$key]=ok
+                    elif ((bpo)) && [[ $p == mesa-opencl-icd ]]; then sim_ok -t "${DEB_CODENAME}-backports" "$p"; SIMC[$key]=${SIM_REASON:-ok}
+                    else sim_ok "$p"; SIMC[$key]=${SIM_REASON:-ok}; fi
+                fi
+                if [[ ${SIMC[$key]} == ok ]]; then okp="${okp:+$okp }$p"
+                else
+                    [[ $mode == plan ]] && PKG_BLOCKED+=("$p: ${SIMC[$key]}")
+                    note="${note:+$note; }$p not installed: ${SIMC[$key]}"
+                fi
+            done
+            pk=$okp
+            if [[ -z $pk ]]; then st=blocked; why="OpenCL runtime not installed - $note"; note=""; fi
+        fi
+        if [[ $mode == final && $st == install ]]; then
+            got=""
+            for p in $pk; do pkg_installed "$p" && got="${got:+$got }$p"; done
+            if [[ -n $got ]]; then st=installed
+            elif ((DO_INSTALL)); then st=failed; why="OpenCL runtime package(s) $pk failed to install (see 00-baseline/apt-install.log); telemetry only"
+            fi
+        fi
+        case $st in
+            present|install|installed)
+                if [[ $rt == *Clover* ]]; then GPU_TESTABLE[$i]=limited; GPU_REASON[$i]="$note"
+                else GPU_TESTABLE[$i]=yes; GPU_REASON[$i]=""; fi
+                AMDINTEL_WANTS_TOOLS=1 ;;
+            *)  GPU_TESTABLE[$i]=limited; GPU_REASON[$i]=$why ;;
+        esac
+        GPU_OCL_RT[$i]=$rt; GPU_OCL_STATE[$i]=$st; GPU_OCL_PKGS[$i]=$pk; GPU_OCL_BPO[$i]=$bpo; GPU_OCL_NOTE[$i]=$note
+        if [[ $st == install && $mode == plan ]]; then
+            for p in $pk; do
+                if ((bpo)) && [[ $p == mesa-opencl-icd ]]; then GPU_BPO_PKGS+=("$p"); else GPU_PKGS+=("$p"); fi
+            done
+        fi
+        # intel_gpu_top gives Intel's busy % (no sysfs counter); optional, only if it installs cleanly.
+        if [[ $k == intel && $AMDINTEL_WANTS_TOOLS == 1 && $GPU_TOOLS != no && $mode == plan ]] && ! pkg_installed intel-gpu-tools && [[ -n $(pkg_cand_ver intel-gpu-tools) ]]; then
+            if [[ -z ${SIMC[igt]:-} ]]; then sim_ok intel-gpu-tools; SIMC[igt]=${SIM_REASON:-ok}; fi
+            [[ ${SIMC[igt]} == ok ]] && GPU_PKGS+=(intel-gpu-tools)
+        fi
+    done
+    return 0
+}
+
+# GPU package set for this run (NVIDIA tools + AMD/Intel runtimes). Called again after apt update.
+compose_gpu_pkgs() {
+    GPU_PKGS=() GPU_BPO_PKGS=() PKG_BLOCKED=() SIMC=()
+    plan_amd_intel_runtimes plan
+    [[ $GPU_TOOLS == no ]] && { GPU_PKGS=(); GPU_BPO_PKGS=(); return 0; }
+    if [[ $GPU_TOOLS == yes ]] || [[ $NVIDIA_USABLE == 1 ]] || [[ ${AMDINTEL_WANTS_TOOLS:-0} == 1 ]]; then
+        # Note: Debian's hashcat has a hard "Depends: pocl-opencl-icd | opencl-icd". The NVIDIA
+        # .run installer provides the ICD file but no package, so apt pulls in pocl (a CPU
+        # OpenCL runtime) plus several LLVM/SPIR-V libraries even with --no-install-recommends.
+        # They are recorded and removed by cleanup.sh; gpu.sh never benchmarks the pocl device.
+        GPU_PKGS+=(hashcat ocl-icd-libopencl1 clinfo clpeak)
+    fi
+    mapfile -t GPU_PKGS < <(printf '%s\n' "${GPU_PKGS[@]}" | awk 'NF && !s[$0]++')
+    mapfile -t GPU_BPO_PKGS < <(printf '%s\n' "${GPU_BPO_PKGS[@]}" | awk 'NF && !s[$0]++')
+    return 0
+}
+GPU_PKGS=() GPU_BPO_PKGS=()
+compose_gpu_pkgs
 
 # What a full prep run would install (shown in the plan before anything is installed).
 PKG_MISSING=()
-for p in "${REQ[@]}" "${GPU_PKGS[@]}"; do pkg_installed "$p" || PKG_MISSING+=("$p"); done
+for p in "${REQ[@]}" "${GPU_PKGS[@]}" "${GPU_BPO_PKGS[@]}"; do pkg_installed "$p" || PKG_MISSING+=("$p"); done
 ((${#SEVENZ_ALT[@]})) && PKG_MISSING+=("7zip (or p7zip-full)")
 mapfile -t PKG_MISSING < <(printf '%s\n' "${PKG_MISSING[@]}" | awk 'NF && !s[$0]++')
 printf '%s\n' "${PKG_MISSING[@]}" | awk 'NF' > "$B/packages-to-install.txt"
@@ -201,6 +368,7 @@ if ((DO_INSTALL)); then
         APT_UPDATE_OK=partial
         tel_warn "apt-get update reported errors (often the enterprise repo without a subscription); continuing with the repos that worked - see 00-baseline/apt-update.log"
     fi
+    compose_gpu_pkgs     # re-plan the AMD/Intel OpenCL runtimes with fresh package lists
     for p in "${REQ[@]}" "${GPU_PKGS[@]}"; do
         if pkg_installed "$p"; then PKG_ALREADY+=("$p")
         elif pkg_candidate "$p"; then PKG_NEW_REQ+=("$p")
@@ -226,6 +394,15 @@ if ((DO_INSTALL)); then
         tel_log "all required tools already installed"
         : > "$B/apt-install.log"
     fi
+    # AMD/Intel runtime from <codename>-backports (Debian 12 AMD), only after its simulation passed.
+    BPO_NEW=()
+    for p in "${GPU_BPO_PKGS[@]}"; do pkg_installed "$p" || BPO_NEW+=("$p"); done
+    if ((${#BPO_NEW[@]})); then
+        tel_log "installing from ${DEB_CODENAME}-backports: ${BPO_NEW[*]}"
+        apt-get install -y -q --no-install-recommends -t "${DEB_CODENAME}-backports" "${APT_NET[@]}" -o DPkg::Lock::Timeout=300 "${BPO_NEW[@]}" >> "$B/apt-install.log" 2>&1 ||
+            PKG_FAILED+=("${BPO_NEW[@]}")
+    fi
+    ((${#PKG_BLOCKED[@]})) && tel_warn "GPU OpenCL runtime package(s) not installed for safety: ${PKG_BLOCKED[*]}"
     ((${#PKG_UNAVAIL[@]})) && tel_warn "not available from the configured repos: ${PKG_UNAVAIL[*]} (the matching sub-tests will be skipped)"
     ((${#PKG_FAILED[@]})) && tel_warn "failed to install: ${PKG_FAILED[*]} (see 00-baseline/apt-install.log)"
 else
@@ -248,6 +425,15 @@ if [[ -n $RCPKGS ]]; then
 fi
 tel_log "newly installed packages (incl. dependencies): ${#NEWLY[@]} -> $LEDGER"
 fi
+
+# Final AMD/Intel GPU status (did the runtime package really get installed?).
+plan_amd_intel_runtimes final
+for i in "${!GPU_SLOTS[@]}"; do
+    case ${GPU_OCL_STATE[$i]} in
+        blocked|failed|unavailable|unsupported|not-installed) tel_warn "GPU ${GPU_SLOTS[$i]} (${GPU_NAME[$i]}): ${GPU_REASON[$i]}" ;;
+    esac
+    [[ -n ${GPU_OCL_NOTE[$i]} ]] && tel_warn "GPU ${GPU_SLOTS[$i]} (${GPU_NAME[$i]}): ${GPU_OCL_NOTE[$i]}"
+done
 
 # ============================================================================ 3. telemetry init (after lm-sensors etc.)
 tel_init
@@ -351,10 +537,10 @@ done <<<"$DIMMS_TSV"
 
 # --- GPUs (enrich with nvidia-smi / sysfs link info)
 OPENCL_NV_ICD=0
-ls /etc/OpenCL/vendors/*nvidia* >/dev/null 2>&1 && OPENCL_NV_ICD=1
+ls "$TEL_ROOT"/etc/OpenCL/vendors/*nvidia* >/dev/null 2>&1 && OPENCL_NV_ICD=1
 GPUS_JSON=""
 for i in "${!GPU_SLOTS[@]}"; do
-    slot=${GPU_SLOTS[$i]}; dev=/sys/bus/pci/devices/$slot
+    slot=${GPU_SLOTS[$i]}; dev=$TEL_ROOT/sys/bus/pci/devices/$slot
     lmax="$(_tel_read "$dev/max_link_speed") x$(_tel_read "$dev/max_link_width")"
     lcur="$(_tel_read "$dev/current_link_speed") x$(_tel_read "$dev/current_link_width")"
     extra=""
@@ -373,11 +559,16 @@ for i in "${!GPU_SLOTS[@]}"; do
     elif [[ ${GPU_KIND[$i]} == amd ]]; then
         vram=$(_tel_read "$dev/mem_info_vram_total") && extra=",\"vram_mib\":$(_tel_div "$vram" 1048576 0)"
     fi
+    if [[ ${GPU_OCL_STATE[$i]} != not-applicable ]]; then
+        extra+=$(printf ',"opencl":{"runtime":%s,"state":%s,"packages":%s,"backports":%s,"note":%s}' \
+            "$(json_str "${GPU_OCL_RT[$i]}")" "$(json_str "${GPU_OCL_STATE[$i]}")" "$(json_arr_str ${GPU_OCL_PKGS[$i]})" \
+            "$(json_bool "${GPU_OCL_BPO[$i]}")" "$(json_str "${GPU_OCL_NOTE[$i]}")")
+    fi
     [[ -n $GPUS_JSON ]] && GPUS_JSON+=","
-    GPUS_JSON+=$(printf '{"slot":%s,"vendor":%s,"vendor_id":%s,"device_id":%s,"name":%s,"driver":%s,"testable":%s,"reason":%s,"pcie_max":%s,"pcie_current":%s%s}' \
+    GPUS_JSON+=$(printf '{"slot":%s,"vendor":%s,"vendor_id":%s,"device_id":%s,"name":%s,"driver":%s,"testable":%s,"reason":%s,"pcie_max":%s,"pcie_current":%s,"integrated":%s,"render_node":%s%s}' \
         "$(json_str "$slot")" "$(json_str "${GPU_KIND[$i]}")" "$(json_str "${GPU_VEND[$i]}")" "$(json_str "${GPU_DEVID[$i]}")" \
         "$(json_str "${GPU_NAME[$i]}")" "$(json_str "${GPU_DRV[$i]}")" "$(json_str "${GPU_TESTABLE[$i]}")" "$(json_str "${GPU_REASON[$i]}")" \
-        "$(json_str "$lmax")" "$(json_str "$lcur")" "$extra")
+        "$(json_str "$lmax")" "$(json_str "$lcur")" "$(json_bool "${GPU_INTEG[$i]}")" "$(json_str "${GPU_RNODE[$i]}")" "$extra")
 done
 TEL_GPUS_JSON=""
 for i in "${!TEL_GPU_KINDS[@]}"; do
@@ -521,7 +712,7 @@ fi
 
 # --- tools
 TOOLS_JSON=""
-for t in stress-ng sysbench 7z 7zz fio nvme smartctl sensors cpupower turbostat gcc memtester dmidecode lspci hashcat clinfo clpeak nvidia-smi rocm-smi; do
+for t in stress-ng sysbench 7z 7zz fio nvme smartctl sensors cpupower turbostat gcc memtester dmidecode lspci hashcat clinfo clpeak nvidia-smi rocm-smi intel_gpu_top radeontop; do
     p=$(command -v "$t" 2>/dev/null) || p=""
     [[ -n $TOOLS_JSON ]] && TOOLS_JSON+=","
     if [[ -n $p ]]; then TOOLS_JSON+="$(json_str "$t"):$(json_str "$p")"; else TOOLS_JSON+="$(json_str "$t"):null"; fi
@@ -537,7 +728,7 @@ printf '{\n'
 printf '  "schema": 1,\n  "generated": %s,\n  "requested_duration_s": %s,\n' "$(json_str "$START_ISO")" "$(json_num "$DURATION")"
 printf '  "host": {"hostname":%s,"pve_version":%s,"pveversion":%s,"debian_version":%s,"kernel":%s,"virtualization":%s,"root_fs":%s,"root_source":%s,"root_disks":%s,"uptime_s":%s},\n' \
     "$(json_str "$HOSTNAME_S")" "$(json_str "$PVE_VER")" "$(json_str "$PVE_FULL")" "$(json_str "$DEB_VER")" "$(json_str "$KERNEL")" \
-    "$(json_str "$VIRT")" "$(json_str "$ROOT_FS")" "$(json_str "$ROOT_SRC")" "$(json_arr_str $ROOT_DISKS)" "$UPTIME_S"
+    "$(json_str "$VIRT")" "$(json_str "$ROOT_FS")" "$(json_str "$ROOT_SRC")" "$(json_arr_str $ROOT_DISKS)" "$(json_num "$UPTIME_S")"
 printf '  "cpu": {"vendor":%s,"vendor_id":%s,"model":%s,"family":%s,"model_id":%s,"stepping":%s,"sockets":%s,"cores":%s,"threads":%s,"threads_per_core":%s,"max_mhz":%s,"min_mhz":%s,"hybrid":%s,"pcores_cpulist":%s,"ecores_cpulist":%s,"microcode":%s,"scaling_driver":%s,"governor":%s,"epp":%s,"boost":%s,"flags":{"avx2":%s,"avx512f":%s,"aes":%s,"sha_ni":%s},"rapl_source":%s,"rapl_pl1_w":%s,"rapl_pl2_w":%s,"temp_source":%s,"throttle_counters":%s},\n' \
     "$(json_str "$CPU_VENDOR")" "$(json_str "$CPU_VENDOR_ID")" "$(json_str "$CPU_MODEL")" "$(json_num "$CPU_FAMILY")" "$(json_num "$CPU_MODEL_ID")" "$(json_num "$CPU_STEPPING")" \
     "$(json_num "$CPU_SOCKETS")" "$(json_num "$CPU_CORES")" "$(json_num "$CPU_THREADS")" "$(json_num "$CPU_TPC")" "$(json_num "$CPU_MAXMHZ")" "$(json_num "$CPU_MINMHZ")" \
@@ -552,9 +743,9 @@ printf '  "disks": [%s],\n  "filesystems": [%s],\n  "pve_storage": [%s],\n  "zfs
 printf '  "guests": {"vms_total":%s,"vms_running":%s,"vms_running_mem_mb":%s,"cts_total":%s,"cts_running":%s,"running":[%s]},\n' \
     "$VM_TOTAL" "$VM_RUN" "$VM_RUN_MEM" "$CT_TOTAL" "$CT_RUN" "$RUNNING_JSON"
 printf '  "tools": {%s},\n  "tool_versions": %s,\n' "$TOOLS_JSON" "$VERS_JSON"
-printf '  "install": {"apt_update":%s,"already_installed":%s,"requested_new":%s,"unavailable":%s,"failed":%s,"newly_installed_incl_deps":%s,"ledger":%s}\n' \
-    "$(json_str "$APT_UPDATE_OK")" "$(json_arr_str "${PKG_ALREADY[@]}")" "$(json_arr_str "${PKG_NEW_REQ[@]}")" "$(json_arr_str "${PKG_UNAVAIL[@]}")" \
-    "$(json_arr_str "${PKG_FAILED[@]}")" "$(json_arr_str "${NEWLY[@]}")" "$(json_str "$LEDGER")"
+printf '  "install": {"apt_update":%s,"already_installed":%s,"requested_new":%s,"backports":%s,"unavailable":%s,"failed":%s,"blocked_for_safety":%s,"newly_installed_incl_deps":%s,"ledger":%s}\n' \
+    "$(json_str "$APT_UPDATE_OK")" "$(json_arr_str "${PKG_ALREADY[@]}")" "$(json_arr_str "${PKG_NEW_REQ[@]}")" "$(json_arr_str "${BPO_NEW[@]}")" "$(json_arr_str "${PKG_UNAVAIL[@]}")" \
+    "$(json_arr_str "${PKG_FAILED[@]}")" "$(json_arr_str "${PKG_BLOCKED[@]}")" "$(json_arr_str "${NEWLY[@]}")" "$(json_str "$LEDGER")"
 printf '}\n'
 } > "$HW"
 if command -v python3 >/dev/null 2>&1; then
@@ -691,7 +882,10 @@ echo "Host:      $HOSTNAME_S  PVE ${PVE_VER:-?}  kernel $KERNEL  root fs $ROOT_F
 echo "CPU:       $CPU_MODEL ($CPU_VENDOR, ${CPU_CORES:-?} cores / $CPU_THREADS threads${PCORE_LIST:+, P-cores $PCORE_LIST E-cores $ECORE_LIST})"
 echo "Sensors:   power=$TEL_RAPL_SRC  temp=$TEL_CPU_TEMP_SRC  PL1=${PL1:-n/a} W PL2=${PL2:-n/a} W"
 echo "RAM:       ${MEM_TOTAL_MB} MB total, ${MEM_AVAIL_MB} MB available, $POPULATED/$SLOTS slots, ECC: ${MEM_ECC:-unknown}"
-for i in "${!GPU_SLOTS[@]}"; do echo "GPU:       ${GPU_SLOTS[$i]} ${GPU_NAME[$i]} [${GPU_DRV[$i]}] testable=${GPU_TESTABLE[$i]} ${GPU_REASON[$i]}"; done
+for i in "${!GPU_SLOTS[@]}"; do
+    echo "GPU:       ${GPU_SLOTS[$i]} ${GPU_NAME[$i]} [${GPU_DRV[$i]}]$( [[ ${GPU_INTEG[$i]} == 1 ]] && echo ' integrated') testable=${GPU_TESTABLE[$i]} ${GPU_REASON[$i]}"
+    [[ -n ${GPU_OCL_RT[$i]} ]] && echo "           OpenCL: ${GPU_OCL_RT[$i]} (${GPU_OCL_STATE[$i]})"
+done
 for n in "${DISKS[@]}"; do echo "Disk:      $n $(disk_kind "$n") $(lsblk -dno SIZE,MODEL "/dev/$n" 2>/dev/null | xargs)"; done
 echo "Guests:    VMs running $VM_RUN/$VM_TOTAL, CTs running $CT_RUN/$CT_TOTAL"
 echo "Idle:      CPU busy avg ${busy_avg:-n/a}%  temp avg ${temp_avg:-n/a} C (max ${temp_max:-n/a})  $(read -r _ _ a _ < <(csv_stats "$CSV" cpu_pkg_w); echo "pkg ${a} W")"

@@ -62,7 +62,7 @@ Made-up round numbers for a generic box, shown for format only:
 |---|---|
 | CPU | 7-Zip multi-thread vs a published result; single-core boost clock vs advertised max turbo; thread scaling vs the expected scaling for the core layout |
 | RAM | STREAM Triad and stress-ng stream vs **typical** real-world for the platform; sysbench single-thread read; DRAM latency. The best result is also shown as % of the **theoretical** maximum |
-| GPU | hashcat MD5 / NTLM / SHA-256 / WPA vs published results; clpeak FP32 vs spec TFLOPS; clpeak memory bandwidth vs spec |
+| GPU | hashcat MD5 / NTLM / SHA-256 / WPA vs published results; clpeak FP32 vs spec TFLOPS; clpeak memory bandwidth vs spec. AMD/Intel: hashcat is compared only with results from the same kind of OpenCL runtime (Mesa rusticl numbers can differ a lot from ROCm or Windows figures). Integrated GPUs and APUs: memory bandwidth vs the RAM's measured speed, and power shown as "shared with the CPU" |
 | SSD / NVMe | Sequential read and write, 4K random read and write IOPS, 4K QD1 read IOPS vs the datasheet. Read-only method: read results only |
 | HDD | Sequential only (fill write, sequential read and write) vs the datasheet's sustained rate. Random results are shown but not scored (a small test file flatters them) |
 | Pool (ZFS/mdraid) | Same as its member type, vs the pool's expected speed (e.g. a mirror reads up to n x one drive) |
@@ -71,7 +71,7 @@ Made-up round numbers for a generic box, shown for format only:
 
 **Part score** = the plain average of that part's main results, always shown with the calculation and a `~` because references are approximate. Example (made-up numbers): "CPU part score: ~97% (7-Zip 96%, boost clock 99%, thread scaling ~95%)".
 
-**Pass/fail checks** are not averaged but override the verdict: data integrity (RAM verify, STREAM validation, memtester) and hardware error counters (machine checks, EDAC, PCIe AER, NVMe media errors, SATA CRC/reallocated/pending sectors, GPU Xid), plus thermal throttling.
+**Pass/fail checks** are not averaged but override the verdict: data integrity (RAM verify, STREAM validation, memtester) and hardware error counters (machine checks, EDAC, PCIe AER, NVMe media errors, SATA CRC/reallocated/pending sectors, GPU Xid on NVIDIA or GPU hangs / resets on AMD and Intel), plus thermal throttling.
 
 ### Verdicts
 

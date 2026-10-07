@@ -870,6 +870,23 @@ def collect_memory(hw):
 
 GPU_VENDORS = {"0x10de": "nvidia", "0x1002": "amd", "0x8086": "intel"}
 BASIC_DISPLAY = {"0x1a03", "0x102b", "0x1234", "0x1b36", "0x15ad"}
+# AMD APU (integrated Radeon) code names as lspci prints them; same list as telemetry.sh.
+APU_RE = re.compile(r"Renoir|Cezanne|Lucienne|Barcelo|Rembrandt|Phoenix|Hawk Point|Raphael|Granite Ridge|Strix|Krackan|"
+                    r"Mendocino|Picasso|Raven|Van Gogh|Dali|Pollock|Stoney|Carrizo|Kaveri|Kabini|Mullins|Beema|Godavari|"
+                    r"Cyan Skillfish|Vega Mobile|Radeon [678][0-9]0M|Radeon 8060S")
+
+
+def gpu_integrated(slot, vendor, name):
+    """True for an integrated GPU (shares RAM and power with the CPU): the Intel iGPU sits at
+    0000:00:02.0; an AMD APU is recognised by its code name, else by a <= 1 GiB VRAM carve-out."""
+    if vendor == "intel":
+        return slot == "0000:00:02.0"
+    if vendor == "amd":
+        if APU_RE.search(name or ""):
+            return True
+        vt = rdi("/sys/bus/pci/devices/%s/mem_info_vram_total" % slot)
+        return bool(vt and vt <= GIB)
+    return False
 
 
 def gpu_list(hw, pci_vm):
@@ -933,11 +950,17 @@ def collect_gpus(hw, pci_vm, ct_gpu, vm_state):
                 for ct, idx in ct_gpu.get("dri", []):
                     if idx is None or any(x_exists("%s/drm/%s%d" % (d, k, n)) for k, n in idx):
                         shared.append(ct)
+        integ = g.get("integrated")
+        if integ is None:
+            integ = gpu_integrated(slot, g.get("vendor"), g.get("name"))
+        oc = g.get("opencl") if isinstance(g.get("opencl"), dict) else None
         out.append({
             "slot": slot, "vendor": g.get("vendor"), "name": g.get("name"), "vendor_id": g.get("vendor_id"),
+            "integrated": bool(integ), "render_node": g.get("render_node") or None, "opencl": oc,
             "device_id": g.get("device_id"), "subsystem": "%s:%s" % (pi["subsystem_vendor_id"], pi["subsystem_device_id"]),
             "driver": drv, "driver_version": drv_ver, "vbios": nv.get("vbios"),
             "vram_mib": vram if vram is not None else (NR if drv != "vfio-pci" else "not readable (vfio-pci)"),
+            "memory_note": "shared system RAM (integrated GPU)" if integ else None,
             "pcie": pci_link(slot), "power_limit_w": pl, "power_default_w": nv.get("power_default_w"),
             "power_max_w": nv.get("power_max_w"),
             "iommu_group": pi["iommu_group"], "iommu_group_devices": grp_members,
@@ -1480,11 +1503,25 @@ def build_plan(inv, hw, D, assumed, mode, out_dir, warnings, packages):
             if g["shared_with_containers"]:
                 w.append("shared with %s - their GPU work competes with the test" % ", ".join(g["shared_with_containers"]))
             full = g["testable"] == "yes"
+            oc = g.get("opencl") or {}
+            rt = oc.get("runtime") or None
+            if g.get("integrated"):
+                w.append("integrated GPU: shares RAM bandwidth and power with the CPU; its power reading is %s" % (
+                    "the CPU package's RAPL 'uncore' share (if the CPU exposes it)" if g["vendor"] == "intel" else "the whole APU package (CPU + GPU)"))
+            if oc.get("note"):
+                w.append(oc["note"])
+            if full:
+                meth = "OpenCL compute stress (hashcat) + benchmarks (hashcat -b, clpeak)"
+                if g["vendor"] in ("amd", "intel") and rt:
+                    meth += " via %s" % rt
+            else:
+                meth = "telemetry; OpenCL stress/benchmarks only if a runtime works (limited)"
             add({"id": "gpu-%s" % g["slot"], "part": "gpu", "status": "test",
                  "method_id": "gpu_compute" if full else "gpu_limited",
-                 "method": "OpenCL compute stress (hashcat) + benchmarks (hashcat -b, clpeak)" if full else
-                           "telemetry + OpenCL stress only if an OpenCL runtime works (limited)",
+                 "method": meth,
                  "label": lab, "pci": g["slot"], "vendor": g["vendor"], "script": "gpu.sh", "out_dir": od,
+                 "integrated": bool(g.get("integrated")), "opencl_runtime": rt,
+                 "opencl_state": oc.get("state"), "opencl_packages": oc.get("packages") or [],
                  "telemetry": ["gpu"],
                  "command": "bash gpu.sh --duration %d --gpu %s --out %s/%s" % (D, g["slot"], DIR, od),
                  "est_s": D + (240 if full else 90), "needs_confirmation": False, "warnings": w, "reason": g["reason"] if not full else None})
@@ -1749,16 +1786,21 @@ def inventory_md(inv):
     if not inv["gpus"]:
         L.append("No display/3D-class PCI device found.")
     else:
-        L += ["| PCI | Model | Driver | VRAM | PCIe (current / max) | Power limit | IOMMU group | Passthrough / sharing | Testable |",
-              "|---|---|---|---|---|---|---|---|---|"]
+        L += ["| PCI | Model | Type | Driver | VRAM | PCIe (current / max) | Power limit | IOMMU group | Passthrough / sharing | OpenCL runtime | Testable |",
+              "|---|---|---|---|---|---|---|---|---|---|---|"]
         for g in inv["gpus"]:
             pc = g["pcie"] or {}
             share = ", ".join(g["passthrough_vms"] + g["shared_with_containers"]) or ("vfio-pci" if g["vfio_bound"] else "host only")
-            L.append("| %s | %s | %s | %s | %s / %s | %s | %s | %s | %s |" % (
-                g["slot"], md_esc(g["name"]), " ".join(x for x in (v(g["driver"]), g["driver_version"]) if x),
-                ("%s MiB" % g["vram_mib"]) if isinstance(g["vram_mib"], (int, float)) else g["vram_mib"],
+            oc = g.get("opencl") or {}
+            ocl = ("%s (%s)" % (oc.get("runtime") or "none", oc.get("state"))) if oc else ("vendor OpenCL ICD" if g["vendor"] == "nvidia" and g.get("opencl_icd") else "-")
+            vram = ("%s MiB" % g["vram_mib"]) if isinstance(g["vram_mib"], (int, float)) else g["vram_mib"]
+            if g.get("integrated"):
+                vram = "shared RAM" + ((" (%s MiB carve-out)" % g["vram_mib"]) if isinstance(g["vram_mib"], (int, float)) else "")
+            L.append("| %s | %s | %s | %s | %s | %s / %s | %s | %s | %s | %s | %s |" % (
+                g["slot"], md_esc(g["name"]), "integrated" if g.get("integrated") else "discrete",
+                " ".join(x for x in (v(g["driver"]), g["driver_version"]) if x), vram,
                 v(pc.get("current")), v(pc.get("max")), v(g["power_limit_w"], " W"), v(g["iommu_group"]), md_esc(share),
-                g["testable"] + ((" - " + g["reason"]) if g["reason"] and g["testable"] != "yes" else "")))
+                md_esc(ocl), g["testable"] + ((" - " + md_esc(g["reason"])) if g["reason"] and g["testable"] != "yes" else "")))
     if inv["gpus"]:
         L += ["", "A GPU or NVMe drive at idle often shows a lower *current* PCIe generation than its maximum: it drops the link to save power and returns to full speed under load."]
     st = inv["storage"]
@@ -1829,7 +1871,8 @@ def plan_md(plan):
         where = u.get("path") or u.get("device") or u.get("pci") or "-"
         if u.get("method_id") == "write_read" and u.get("test_file_gib"):
             where += " (%s GiB test file)" % u["test_file_gib"]
-        notes = "; ".join(([u["reason"]] if u.get("reason") else []) + u.get("warnings", []) +
+        notes = "; ".join(([u["reason"]] if u.get("reason") else []) +
+                          (["OpenCL: %s" % u["opencl_runtime"]] if u.get("opencl_runtime") and u.get("method_id") == "gpu_compute" else []) + u.get("warnings", []) +
                           (["**ask the user first**"] if u.get("needs_confirmation") else []))
         L.append("| %s | %s | %s | %s | %s | %s | %s |" % (
             ("opt" if u.get("optional") else u["seq"]), u["part"].upper(), md_esc(u["label"]), u["method"], md_esc(where),

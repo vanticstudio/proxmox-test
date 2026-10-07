@@ -2,11 +2,11 @@
 
 A Claude Code skill that stress-tests and benchmarks the hardware of your Proxmox VE host over SSH, one part at a time, and writes a plain-English report that tells you whether each part performs as it should.
 
-- **Finds everything on its own:** it inventories the whole box (board and BIOS, every CPU socket, every DIMM slot, every GPU, every NVMe/SATA/SAS drive including those behind HBAs and RAID controllers, NICs) and builds a test plan that scales to it. A mini PC with one SSD and no GPU and a dual-socket server with several GPUs and a shelf of drives get the same report structure, covering every single part.
+- **Finds everything on its own:** it inventories the whole box (board and BIOS, every CPU socket, every DIMM slot, every GPU (NVIDIA, AMD or Intel, discrete or integrated), every NVMe/SATA/SAS drive including those behind HBAs and RAID controllers, NICs) and builds a test plan that scales to it. A mini PC with one SSD and no GPU and a dual-socket server with several GPUs and a shelf of drives get the same report structure, covering every single part.
 - **Order:** CPU -> RAM -> GPU 1..n -> SSD 1..n -> HDD 1..n, strictly one after another.
 - **You choose the length:** a 30-second quick test, or 1, 5 or 10 minutes of full load per part (benchmarks add a few minutes on top).
 - **Telemetry every second:** CPU package power (RAPL), temperatures, clocks, throttle counters, GPU power/clock/temperature, drive temperatures and throughput.
-- **Health checks before and after each part:** machine-check / EDAC / PCIe AER errors, RAM data verification, GPU driver (Xid) errors, SMART and NVMe error counters.
+- **Health checks before and after each part:** machine-check / EDAC / PCIe AER errors, RAM data verification, GPU driver errors (NVIDIA Xid; AMD/Intel GPU hangs, resets and ring timeouts), SMART and NVMe error counters.
 - **Disk-safe for any layout:** disks with a filesystem of their own get a full read/write test on a temporary file; disks without one (LVM-thin, ZFS/Ceph/mdraid members, hardware RAID volumes without a filesystem) are read in read-only mode, so nothing on them is ever written. Disks and GPUs passed through to a running VM are skipped.
 - **Scored report:** every result is compared with the manufacturer's spec sheet, well-known published results or the theoretical maximum, as "% of expected", with a verdict per part and concrete recommendations. Where no reference exists, it says so instead of making one up.
 - **Three report formats:** a Markdown report, a designed HTML report (light and dark mode, works offline) that opens in your browser automatically, and a PDF of the same page.
@@ -14,11 +14,11 @@ A Claude Code skill that stress-tests and benchmarks the hardware of your Proxmo
 
 ## What it uses
 
-`stress-ng`, `sysbench` and `7-Zip` (CPU); a bundled STREAM and pointer-chase latency test, `stress-ng --vm --verify` and `memtester` (RAM); `hashcat` and `clpeak` over OpenCL (NVIDIA GPU); `fio`, `smartctl` and `nvme-cli` (disks). All installed from your host's own apt repos.
+`stress-ng`, `sysbench` and `7-Zip` (CPU); a bundled STREAM and pointer-chase latency test, `stress-ng --vm --verify` and `memtester` (RAM); `hashcat` and `clpeak` over OpenCL (NVIDIA, AMD and Intel GPUs; for AMD/Intel through a userland OpenCL runtime such as Mesa rusticl or Intel compute-runtime); `fio`, `smartctl` and `nvme-cli` (disks). All installed from your host's own apt repos.
 
 ## Requirements
 
-- Proxmox VE 8 or 9 (Debian 12/13), Intel or AMD CPU. GPU optional (NVIDIA tested; AMD/Intel get telemetry and best-effort benchmarks).
+- Proxmox VE 8 or 9 (Debian 12/13), Intel or AMD CPU. GPU optional: NVIDIA, AMD and Intel, discrete and integrated. NVIDIA needs the host's `nvidia` driver with its OpenCL ICD; AMD/Intel use the in-kernel driver plus an OpenCL runtime from the host's apt repos, which the skill installs and removes (best coverage on PVE 9; on PVE 8, AMD needs Mesa from `bookworm-backports`). GPUs without a usable runtime still get telemetry.
 - [Claude Code](https://claude.com/claude-code) (or another Claude client that supports skills and can run shell commands) on a machine that can SSH to the host.
 - **Key-based SSH as root** (or Tailscale SSH). The skill never asks for or stores a password. If you don't have a key yet: `ssh-keygen -t ed25519` then `ssh-copy-id root@<your-pve-ip>`.
 - For full read/write disk scores, some free space on each disk: about 2x the test file (16 GB for an SSD, 8 GB for an HDD), on a mounted filesystem (e.g. `/var/lib/vz` or a directory storage). Disks without one are still tested, read-only.
@@ -103,10 +103,10 @@ proxmox-hardware-stress-test/
     ├── inventory.py                 full inventory + per-component test plan (called by prep.sh)
     ├── cpu.sh                       CPU stress + sysbench + 7-Zip
     ├── ram.sh, stream.c, latency.c  RAM stress + bandwidth + latency + memtester
-    ├── gpu.sh                       GPU stress + hashcat + clpeak
+    ├── gpu.sh                       GPU stress + hashcat + clpeak (NVIDIA, AMD, Intel)
     ├── disk.sh                      fio tests for NVMe/SSD/HDD (file-based, or read-only raw)
     ├── cleanup.sh                   removes test files, installed packages, working dir
     └── finish_report.py             runs locally: embeds fonts, makes the PDF, opens the HTML
 ```
 
-**Developer testing (not used in a real run):** `inventory.py` has a test hook: with `PVE_STRESS_MOCK_DIR=<fixture dir>` set, it reads `/sys`, `/proc`, `/dev` and `/etc/pve` from `<fixture dir>/root/` and takes every command's output from `<fixture dir>/commands.json`. That lets the inventory and test plan be checked against simulated hosts (multi-socket servers, HBAs, hardware RAID, ZFS/Ceph/mdraid, passthrough, mini PCs) on any machine. Details are in the script's header.
+**Developer testing (not used in a real run):** `inventory.py` has a test hook: with `PVE_STRESS_MOCK_DIR=<fixture dir>` set, it reads `/sys`, `/proc`, `/dev` and `/etc/pve` from `<fixture dir>/root/` and takes every command's output from `<fixture dir>/commands.json`. That lets the inventory and test plan be checked against simulated hosts (multi-socket servers, HBAs, hardware RAID, ZFS/Ceph/mdraid, passthrough, mini PCs) on any machine. Details are in the script's header. Likewise `PVE_STRESS_SYSFS_ROOT=<dir>` makes the GPU reads of `telemetry.sh`, `gpu.sh` and `prep.sh` (sysfs, `/dev/dri`, `/etc/OpenCL/vendors`, `/etc/os-release`, `/etc/pve/lxc`) come from `<dir>`, so the AMD/Intel GPU paths can be run against a fake host with fake `clinfo` / `hashcat` / `clpeak` on `PATH` (see `docs/developing.md`).

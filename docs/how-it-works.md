@@ -50,8 +50,8 @@ Units always run in this order, **strictly one at a time**: **CPU -> RAM -> GPU 
 |---|---|---|
 | `cpu_stress` | The CPU (one unit, even with several sockets) | All threads of all sockets at 100% (stress-ng), then sysbench and 7-Zip benchmarks; per-socket figures |
 | `ram_stress` | The RAM (one unit, all DIMMs together) | stress-ng with every write read back and checked, STREAM bandwidth, latency, sysbench, memtester. Every NUMA node is loaded |
-| `gpu_compute` | Each NVIDIA GPU on the host's `nvidia` driver | hashcat as a steady compute load, then hashcat benchmarks (MD5, NTLM, SHA-256, WPA) and clpeak, all over OpenCL |
-| `gpu_limited` | AMD / Intel GPUs | Telemetry from sysfs; benchmarks only if a working OpenCL runtime exists |
+| `gpu_compute` | Each GPU the host drives itself: NVIDIA on the `nvidia` driver; AMD (`amdgpu`) and Intel (`i915` / `xe`), discrete or integrated, when an OpenCL runtime for it is available from the host's apt repos | hashcat as a steady compute load, then hashcat benchmarks (MD5, NTLM, SHA-256, WPA) and clpeak, all over OpenCL. On AMD/Intel only the GPU's own runtime and device are visible to the tools; if hashcat can't use that runtime, clpeak's kernels in a loop are the load instead |
+| `gpu_limited` | AMD / Intel GPUs with no usable OpenCL runtime (e.g. AMD on PVE 8 without backports, Intel Gen7 or older, or a runtime install that would upgrade host packages) | Telemetry from sysfs/hwmon; the plan says why. OpenCL tests still run if a runtime turns out to work |
 | `write_read` | A disk with a writable, mounted filesystem of its own and at least 2x the test file free | fio on **one temporary test file** (max 8 GiB on SSD/NVMe, 4 GiB on HDD, never more than 10% of free space), deleted afterwards. Full read + write scores. On the boot disk this is usually `/var/lib/vz` |
 | `read_only_raw` | ZFS / Ceph / mdraid members, LVM-only disks, unmounted or nearly full disks, hardware RAID volumes without a filesystem, raw disks of stopped VMs | fio opens the whole device with `--readonly`, and a guard refuses any job that isn't a pure read. Read scores only |
 | Pool unit (optional) | Each multi-disk filesystem (ZFS mirror/RAIDZ, mdraid) | `write_read` on the pool's path, to measure the pool's write path. Only run if you ask for it |
@@ -73,13 +73,23 @@ bash /root/pve-stresstest/prep.sh --out RUN --duration D
 
 This installs the test tools **from the host's own apt repositories only**, records every package that wasn't there before (the "package ledger", `installed-packages.txt`), takes a 30-second idle baseline with SMART snapshots and error counters, and rebuilds the plan with complete data. If the new plan differs from the one you approved, Claude tells you before running anything.
 
-Tools installed when missing: `stress-ng`, `sysbench`, 7-Zip, `fio`, `nvme-cli`, `smartmontools`, `lm-sensors`, `linux-cpupower`, `dmidecode`, `pciutils`, `memtester`, `gcc`, `libc6-dev`, `python3`, plus `hashcat`, `ocl-icd-libopencl1`, `clinfo` and `clpeak` when an NVIDIA GPU runs on the host's driver (Debian's `hashcat` also pulls in `pocl-opencl-icd` and some LLVM libraries; they are recorded and removed too). For AMD / Intel GPUs, Mesa OpenCL is installed only with the opt-in `prep.sh --amd-intel-opencl` flag. GPU drivers, kernels and firmware are never installed or changed. Without internet, the sub-tests that need a missing tool are skipped and the report says so.
+Tools installed when missing: `stress-ng`, `sysbench`, 7-Zip, `fio`, `nvme-cli`, `smartmontools`, `lm-sensors`, `linux-cpupower`, `dmidecode`, `pciutils`, `memtester`, `gcc`, `libc6-dev`, `python3`, plus `hashcat`, `ocl-icd-libopencl1`, `clinfo` and `clpeak` when the host drives a GPU (Debian's `hashcat` also pulls in `pocl-opencl-icd` and some LLVM libraries; they are recorded and removed too).
+
+For **AMD and Intel GPUs** prep also installs the userland OpenCL runtime that fits the Debian release and the GPU:
+
+| GPU | PVE 9 (Debian 13) | PVE 8 (Debian 12) |
+|---|---|---|
+| AMD (`amdgpu`), discrete or APU | `mesa-opencl-icd` (Mesa rusticl, radeonsi) | Mesa rusticl needs 23.1+: `mesa-opencl-icd` from `bookworm-backports` if that suite is in the host's apt sources; otherwise "limited" (Clover only) |
+| Intel (`i915`), Gen8+ iGPU or Arc | `mesa-opencl-icd` (Mesa rusticl, iris) | `intel-opencl-icd` (Intel compute-runtime) plus `mesa-opencl-icd` as a fallback |
+| Intel (`xe`), e.g. Arc B-series | `mesa-opencl-icd` (needs Mesa 24.1+) | "limited" (Mesa too old) |
+
+`intel-gpu-tools` (for Intel busy %) is added when available. Each runtime package is simulated with apt first and is **not** installed if it would pull in a kernel, firmware, DKMS or microcode package or **upgrade** a package already on the host (cleanup can only remove new packages); the GPU is then "limited" with that reason. GPU drivers, kernel modules, kernels and firmware are never installed or changed. Without internet, the sub-tests that need a missing tool are skipped and the report says so.
 
 ## Step 4: Run the units
 
 Each unit's command is started **detached** on the host (`nohup setsid`), so a dropped SSH connection can't kill a test halfway. Claude waits for the unit's exit-code file, reads its `summary.json` and gives you a one-line update ("SSD 2 of 4 done ..."). Then the next unit starts, never before.
 
-If a unit reports **hardware errors** (machine-check/EDAC errors, RAM miscompares, new GPU Xid errors, disk I/O errors, rising SMART counters), Claude **stops and asks you** before going on.
+If a unit reports **hardware errors** (machine-check/EDAC errors, RAM miscompares, new GPU Xid errors or AMD/Intel GPU hangs and resets, disk I/O errors, rising SMART counters), Claude **stops and asks you** before going on.
 
 ### How long it takes
 
@@ -89,8 +99,8 @@ Each unit takes `D` plus a fixed extra for its benchmarks. These are the planner
 |---|---|---|---|---|---|
 | CPU | D + 150 s | 3 min | 3.5 min | 7.5 min | 12.5 min |
 | RAM | D + memtester (D, clamped to 30-300 s) + 195 s | ~4.3 min | ~5.3 min | ~13.3 min | ~18.3 min |
-| GPU, NVIDIA (`gpu_compute`) | D + 240 s | 4.5 min | 5 min | 9 min | 14 min |
-| GPU, AMD/Intel (`gpu_limited`) | D + 90 s | 2 min | 2.5 min | 6.5 min | 11.5 min |
+| GPU, any vendor (`gpu_compute`) | D + 240 s | 4.5 min | 5 min | 9 min | 14 min |
+| GPU, telemetry only (`gpu_limited`) | D + 90 s | 2 min | 2.5 min | 6.5 min | 11.5 min |
 | NVMe, `write_read` | D + 35 s | ~1.1 min | ~1.6 min | ~5.6 min | ~10.6 min |
 | SATA/SAS SSD, `write_read` | D + 70 s | ~1.7 min | ~2.2 min | ~6.2 min | ~11.2 min |
 | HDD, `write_read` | D + 90 s | 2 min | 2.5 min | 6.5 min | 11.5 min |
@@ -109,9 +119,9 @@ Telemetry is sampled **once per second** for the whole run into CSV files, with 
 | CPU temperature | `coretemp` (Intel), `k10temp` / `zenpower` Tdie or Tctl (AMD), else the `x86_pkg_temp` or `acpitz` thermal zone. Hottest socket |
 | CPU clocks, busy %, throttling | sysfs and `/proc/stat`; P-core and E-core clocks on hybrid Intel; Intel `thermal_throttle` counters; `turbostat` alongside the CPU stress when installed |
 | Memory | used / available / swap |
-| GPU | `nvidia-smi` (temperature, power vs limit, clocks, utilisation, fan, VRAM, throttle reasons, PCIe link); `amdgpu` / `i915` sysfs and hwmon for AMD/Intel |
+| GPU | NVIDIA: `nvidia-smi` (temperature, power vs limit, clocks, utilisation, fan, VRAM, throttle reasons, PCIe link). AMD / Intel: `amdgpu` / `i915` / `xe` sysfs and hwmon (edge, junction and memory temperature, power, core clock vs its max, memory clock, busy %, VRAM/GTT, fan, power limit, PCIe link, Intel throttle reasons); `intel_gpu_top` for Intel busy % when installed. Integrated GPUs: power from the CPU's RAPL "uncore" domain (Intel) or the APU package (AMD), marked "shared with CPU" |
 | Disks | Temperature from NVMe hwmon / `drivetemp`, else `smartctl -n standby` (doesn't wake a sleeping HDD); throughput from `/proc/diskstats` (informational; scores use fio's own figures) |
-| Health before and after each part | `smartctl` and `nvme smart-log`, SATA error log, and kernel error counters: machine checks (MCE), EDAC memory errors, PCIe AER errors, NVIDIA Xid lines |
+| Health before and after each part | `smartctl` and `nvme smart-log`, SATA error log, and kernel error counters: machine checks (MCE), EDAC memory errors, PCIe AER errors, NVIDIA Xid lines, AMD/Intel GPU hang / reset / ring-timeout lines |
 
 ## Step 5: Copy the logs back and verify
 

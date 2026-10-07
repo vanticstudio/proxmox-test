@@ -20,6 +20,7 @@ There are three ways to install the skill. All three give Claude **the same file
 | `ssh`, `tar` and `python3` (macOS, Linux or WSL; bash or zsh) | Root SSH access with a **key** (or Tailscale SSH) |
 | Optional: Chrome, Chromium, Edge or Brave for the PDF (otherwise print the HTML to PDF yourself) | Internet access for `apt` (to install the test tools; they are removed again afterwards) |
 | | For full read+write disk scores: some free space on each disk (about 2x the test file, so ~16 GB on an SSD, ~8 GB on an HDD) on a mounted filesystem. Disks without one are tested read-only |
+| | Optional GPU: NVIDIA, AMD and Intel, discrete and integrated. NVIDIA needs the proprietary `nvidia` driver with its OpenCL ICD on the host; AMD and Intel use the driver already in the Proxmox kernel, and the skill installs (and later removes) the matching OpenCL runtime from your apt repos. Best coverage on PVE 9; on PVE 8, AMD cards need Mesa from `bookworm-backports` (add that suite yourself if you want it). A GPU passed through to a VM is never touched |
 
 ### Set up SSH key login to the host
 

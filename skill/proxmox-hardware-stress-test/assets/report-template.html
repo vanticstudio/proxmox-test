@@ -28,6 +28,13 @@
       A skipped unit may get a short <section class="sheet skipped"> with only the top line and one sentence why; absent parts get none.
       Disks read in read-only mode: say "read-only test, no write scores" in the model line and leave write tests out of the gauge. Each has: top line + pill, a 2-3 sentence plain-English lede,
       4 stat tiles, a gauge with the part's main "% of expected" results, two takeaway boxes, and a <details> table with all scores.
+    - GPU sheets (any vendor): the model line names vendor, discrete/integrated and how it was driven, e.g.
+      "AMD Radeon RX 6600 · 0000:03:00.0 · OpenCL via Mesa rusticl" or "Intel UHD Graphics 770 · integrated · OpenCL via
+      Intel compute-runtime". Stat tiles: power (for an iGPU / APU write "shared with CPU" in the .s line and never compare
+      it with a discrete card; "not measurable" when there is no sensor), peak temperature (AMD: junction/hotspot in the .s
+      line), core clock (AMD/Intel: average vs max, from clock_vs_max_pct), and memory (VRAM used, or "shared RAM" for an
+      iGPU / APU). If hashcat could not run on that runtime, leave hashcat out of the gauge and say so in the lede; a GPU
+      tested only with telemetry ("limited") gets a short sheet with its sensor readings and the reason.
     - Pill / verdict classes: default = pass (green). Use class "warn" on .pill/.verdict for parts below ~90% or with warnings,
       and "fail" for errors or thermal throttling.
     - Keep the copy short, plain English, no jargon without a short explanation. Use only numbers from the run's logs.
@@ -306,8 +313,10 @@ code{font-family:var(--mono);font-size:.9em;background:var(--accent-soft);paddin
     <div class="hw-block"><h3>GPUs <span class="eyebrow">{{N}} found</span></h3>
       <div class="tbl"><table>
         <tr><th>Unit</th><th>Model</th><th>Driver</th><th>VRAM</th><th>PCIe link</th><th>Tested</th></tr>
-        <!-- REPEAT per GPU; none: <tr class="empty"><td colspan="6">None found</td></tr>; not tested: <span class="pill muted">skipped · {{REASON}}</span> -->
-        <tr><td>{{GPU 1}}</td><td>{{MODEL}}</td><td>{{DRIVER VERSION}}</td><td class="n">{{GB}}</td><td class="n">{{GenN xN}}</td><td><span class="pill">tested</span></td></tr>
+        <!-- REPEAT per GPU; none: <tr class="empty"><td colspan="6">None found</td></tr>; not tested: <span class="pill muted">skipped · {{REASON}}</span>;
+             telemetry only: <span class="pill warn">limited · {{REASON}}</span>. Integrated GPU / APU: add <span class="eyebrow">integrated</span>
+             after the model, VRAM "shared RAM", PCIe link "-". Driver cell: driver + version, plus the OpenCL runtime on AMD/Intel. -->
+        <tr><td>{{GPU 1}}</td><td>{{MODEL}}</td><td>{{DRIVER VERSION · OpenCL RUNTIME}}</td><td class="n">{{GB or shared RAM}}</td><td class="n">{{GenN xN}}</td><td><span class="pill">tested</span></td></tr>
       </table></div>
     </div>
     <div class="hw-block"><h3>Storage <span class="eyebrow">{{N}} controllers · {{N}} disks</span></h3>

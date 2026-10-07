@@ -61,7 +61,7 @@ The **stable public interface** is listed in the file's header. The parts you'll
 | Group | Functions |
 |---|---|
 | CPU | `cpu_power`, `cpu_temp`, `cpu_mhz`, `cpu_mhz_hybrid`, `cpu_busy`, `cpu_throttle`, per-socket `cpu_power_sockets` / `cpu_temp_sockets` |
-| Memory / GPU | `mem_usage`; `gpu_count`, `gpu_list`, `gpu_query [IDX]` (10 fields in `TEL_GPU_FIELDS` order) |
+| Memory / GPU | `mem_usage`; `gpu_count`, `gpu_list`, `gpu_query [IDX]` (10 fields in `TEL_GPU_FIELDS` order, any vendor); `gpu_query_ext IDX` (17 AMD/Intel fields in `TEL_GPU_EXT_FIELDS` order); `gpu_index_for_pci`, `gpu_is_integrated_pci`, `gpu_util_helper_start` / `gpu_util_helper_stop` (optional `intel_gpu_top` / `radeontop`) |
 | Disks | `disk_temp`, `disk_io`, `disk_kind`, `path_disks`, `fs_type`, `fs_avail_bytes`, `disk_smart_snapshot`, `smart_brief` |
 | Hardware errors | `hw_error_snapshot`, `hw_error_diff A B` |
 | 1 Hz sampler | `tel_sampler_start FILE [cpu mem gpu[:IDX] disk:DEV sockets]`, `tel_phase NAME`, `tel_sampler_stop` |
@@ -117,6 +117,24 @@ cat "$OUT/plan.md"
 ```
 
 Good fixtures to keep around: a mini PC with one SSD, a dual-socket server, an HBA with many SATA disks, a hardware RAID controller, ZFS/Ceph/mdraid members, a GPU passed through to a VM, a GPU shared with containers. The repository doesn't ship fixtures yet; if you add some, scrub them of real serials, hostnames and IP addresses first.
+
+## The developer-only fake-root hook for the shell scripts (`PVE_STRESS_SYSFS_ROOT`)
+
+`telemetry.sh`, `gpu.sh` and `prep.sh` have a matching hook for the GPU code, so the AMD and Intel paths can be exercised without the hardware. It is **never set in a real run**; unset (or `/`) means the real files.
+
+When `PVE_STRESS_SYSFS_ROOT=DIR` is set, these **reads** come from `DIR/...` instead of `/...` (nothing is ever written there):
+
+| Script | Paths redirected |
+|---|---|
+| `telemetry.sh` | GPU detection (`/sys/class/drm/card*`), `gpu_query_ext`, `gpu_is_integrated_pci` (`/sys/bus/pci/devices`), RAPL including the iGPU's `uncore` domain (`/sys/class/powercap`, `amd_energy` hwmon) |
+| `gpu.sh` | `/sys/bus/pci/devices` (enumeration and render nodes), `/dev/dri`, `/etc/OpenCL/vendors`, `/etc/pve/lxc` (also passed on to `telemetry.sh`) |
+| `prep.sh` | GPU detection, `/etc/OpenCL/vendors` and `/etc/os-release` (the Debian codename that picks the OpenCL runtime packages) |
+
+Commands are **not** redirected: put fake executables first on `PATH` instead (`lspci`, `nvidia-smi`, `clinfo`, `hashcat`, `clpeak`, `dmesg`, `intel_gpu_top`, and for the package planning `apt-cache`, `apt-get` (simulation only), `dpkg-query`, `dpkg --compare-versions`). On macOS also put a bash 5 build, GNU-style `timeout` and Debian's default `mawk` (as `awk`) on `PATH`, so the scripts run with the same shell and awk as on the host.
+
+A fake sysfs tree needs, per GPU: `sys/bus/pci/devices/<addr>/{class,vendor,device}`, a `driver` symlink whose target is named after the driver (`amdgpu`, `i915`, `xe`, `nvidia`, `vfio-pci`), `drm/cardN` and `drm/renderDN` folders (each with a `device -> ../..` symlink), `sys/class/drm/cardN` linking to that folder, and the sensor files the vendor uses (amdgpu: `hwmon/hwmon*/temp*_{input,label}`, `power1_average` or `power1_input`, `gpu_busy_percent`, `pp_dpm_sclk`, `mem_info_vram_*`; i915: `gt_act_freq_mhz`, `gt_max_freq_mhz`, `gt/gt0/throttle_reason_*`; xe: `tile0/gt0/freq0/{act_freq,max_freq,throttle/*}` and an `energy1_input` hwmon). `etc/OpenCL/vendors/*.icd` decides which runtimes `gpu.sh` probes; `prep.sh` also needs `etc/os-release`. Run `prep.sh` from a copy of the scripts with only the root check removed, together with `PVE_STRESS_MOCK_DIR` for `inventory.py`, and with `--plan-only`.
+
+Scenarios worth keeping: an AMD card on Mesa rusticl (with and without PCI info in `clinfo`), an AMD card with ROCm installed, an AMD APU, an Intel Arc card on `xe` and on `i915`, an Intel iGPU (RAPL `uncore` power, throttle reasons, no FP64), an old Gen7 iGPU, NVIDIA plus AMD in one box, two cards of the same vendor without PCI info, and a card bound to `vfio-pci`. For the package planning, vary the Debian release, `bookworm-backports`, and a simulated install that would upgrade an installed package or pull a firmware package. Keep the fixtures outside the repository, or scrub them of real serials, hostnames and addresses first.
 
 ## Adding a new test
 
@@ -175,7 +193,7 @@ It repacks the folder into `dist/proxmox-hardware-stress-test.skill` and `dist/p
 
 1. [ ] All checks above pass (`bash -n`, `shellcheck`, Python compile, C compile).
 2. [ ] Tested on a real Proxmox host, at least a 30-second run end to end: plan-only, full run, logs VERIFIED, reports made, cleanup reports "Working dir: deleted" and removes only the ledger's packages.
-3. [ ] If the planner changed: checked against mock fixtures (`PVE_STRESS_MOCK_DIR`) for the layouts it affects.
+3. [ ] If the planner changed: checked against mock fixtures (`PVE_STRESS_MOCK_DIR`) for the layouts it affects; if GPU code changed, against fake hosts (`PVE_STRESS_SYSFS_ROOT`, see above).
 4. [ ] Script headers, `SKILL.md`, `references/`, the skill's `README.md` and `docs/` match the new behaviour.
 5. [ ] No personal data anywhere: no real hostnames, IP addresses (use `192.0.2.x` examples), serials, usernames or local paths; sample numbers clearly marked as made-up examples.
 6. [ ] No stray files in the skill folder (`__pycache__`, `.DS_Store`, editor backups, test output).

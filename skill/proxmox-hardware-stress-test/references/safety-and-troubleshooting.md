@@ -3,7 +3,7 @@
 ## Contents
 1. What the skill never does, and why
 2. Guests running during the test
-3. GPU passthrough and unsupported GPUs
+3. GPUs: passthrough, NVIDIA, AMD and Intel
 4. ZFS and the ARC
 5. Disks without a usable filesystem
 6. Missing sensors and "n/a"
@@ -39,21 +39,45 @@ The skill leaves running guests alone. Effects to explain to the user and in the
 - `prep.sh` warns when the host is more than 15% busy at idle. If it is, suggest stopping guests or testing at a quiet time; let the user decide.
 - Ballooning VMs can reclaim memory during the RAM test; the RAM script reserves their headroom, which may make the tested size smaller.
 
-## 3. GPU passthrough and unsupported GPUs
+## 3. GPUs: passthrough, NVIDIA, AMD and Intel
 
 `prep.sh` marks each GPU `testable` yes / limited / no with a reason:
 - **vfio-pci** (passed through to a VM): not tested. To test it, the user must stop that VM and rebind the card to the host driver themselves; that is outside this skill.
 - **nouveau** or no driver: not tested; the open driver has no usable compute path. The NVIDIA proprietary driver (and its OpenCL ICD) must be installed on the host by the user.
 - **NVIDIA with driver but no OpenCL ICD** (`/etc/OpenCL/vendors/nvidia.icd` missing): hashcat/clpeak see no device. The `.run` installer and the `nvidia-opencl-icd` package provide it.
-- **AMD (amdgpu) and Intel (i915/xe)**: "limited": telemetry from sysfs; benchmarks only if an OpenCL runtime works (`prep.sh --amd-intel-opencl` installs Mesa rusticl, often slow or unsupported). Scores from Mesa OpenCL are not comparable with ROCm/Windows reviews; say so.
+- **AMD (amdgpu) and Intel (i915/xe), discrete and integrated**: fully tested (`testable: yes`, `gpu_compute`) when a userland OpenCL runtime for that GPU is available from the host's apt repos; `prep.sh --gpu-tools auto` installs it (see "AMD and Intel GPUs" below). Otherwise "limited" (telemetry only) with the exact reason in the plan. The kernel drivers are already part of the Proxmox kernel; the skill never installs drivers, kernel modules, DKMS packages or firmware.
 - **BMC/server graphics** (ASPEED, Matrox): not a compute GPU; skipped.
 - CUDA is deliberately not used (needs NVRTC, absent on a bare host). OpenCL results are within a few % of CUDA for hashcat.
 - hashcat's 90 °C abort watchdog stays on.
 - Debian's `hashcat` package has a hard dependency on an OpenCL ICD *package*. The NVIDIA `.run` installer provides the ICD file but no package, so apt installs `pocl-opencl-icd` (a CPU OpenCL runtime) plus LLVM/SPIR-V libraries. They are recorded and removed at cleanup. `gpu.sh` uses `-D 2` (GPU devices only) and runs clpeak only on the GPU's own platform, so pocl is never benchmarked.
-- Only `NVRM: Xid` kernel lines are GPU errors, and only new ones (counted before and after) count. A bare "xid" search also matches unrelated kernel lines (other drivers can print "XID" too).
+- Only `NVRM: Xid` kernel lines are GPU errors, and only new ones (counted before and after) count. A bare "xid" search also matches unrelated kernel lines (other drivers can print "XID" too). On AMD/Intel the equivalent is new kernel lines for that PCI address about ring timeouts, GPU hangs, GPU/GT resets or page faults (`gpu_error_lines_before/after`).
 - **Several GPUs:** the plan has one unit per card (`gpu.sh --gpu <PCI address>`, out dirs `03-gpu-1`, `03-gpu-2`, ...). `gpu.sh --list` shows every display device with its index and whether it is testable; `gpu.sh --all` tests them all one after another (per-card folders `gpu<N>/` plus an aggregate `summary.json`). It restricts nvidia-smi to that card and maps it to hashcat's device number via `hashcat -I`. If the mapping fails, it warns that hashcat loaded all GPUs at once. A PCI address that is not a display device is a usage error (exit 2).
-- **GPU shared with LXC containers** (`/dev/nvidia*` or `/dev/dri/*` passed in, e.g. Plex, Jellyfin or an AI inference container): the stress competes with their work and can fill VRAM. The plan matches `/dev/nvidiaN` to the card with nvidia-smi index N (only `nvidiactl`/`nvidia-uvm` = all NVIDIA cards) and puts a warning on that GPU's unit. Mention this in the plan; stopping those containers is the user's choice.
+- **GPU shared with LXC containers** (`/dev/nvidia*` or `/dev/dri/*` passed in, e.g. Plex, Jellyfin or an AI inference container): the stress competes with their work and can fill VRAM. The plan matches `/dev/nvidiaN` to the card with nvidia-smi index N (only `nvidiactl`/`nvidia-uvm` = all NVIDIA cards) and `/dev/dri/cardN` / `renderDN` to the AMD/Intel card behind it (a bare `/dev/dri` = all of them), and puts a warning on that GPU's unit; on AMD/Intel `gpu.sh` repeats the warning in its summary. The GPU is still tested (it is not passed through). Mention this in the plan; stopping those containers is the user's choice. An iGPU used for transcoding (Plex/Jellyfin Quick Sync) is the common case.
 - hashcat, pocl and NVIDIA kernel caches go to `/root/pve-stresstest/.gpu-cache` (removed by cleanup), not `/root/.cache`, `/root/.local/share/hashcat` or `/root/.nv`.
+
+### AMD and Intel GPUs
+
+How `gpu.sh` tests them (the same hashcat stress, hashcat benchmarks and clpeak as on NVIDIA, through a userland OpenCL runtime):
+
+| Runtime (OpenCL platform) | Package (host apt repos) | Covers | Notes |
+|---|---|---|---|
+| Mesa **rusticl** | `mesa-opencl-icd` | AMD GCN/RDNA via radeonsi (**Mesa 23.1+**), Intel Gen8+ via iris (Mesa 22.3+; the **xe** kernel driver needs Mesa 24.1+) | The default on PVE 9 (Debian 13, Mesa 25). On PVE 8 (Debian 12, Mesa 22.3) rusticl works for Intel only; AMD needs Mesa from `bookworm-backports`, used only when that suite is already in the host's apt sources and installs without upgrading anything |
+| Intel **compute-runtime** (NEO) | `intel-opencl-icd` | Intel Gen9-Gen12 iGPUs and early Arc on `i915` | Packaged for Debian 12 only, **not in Debian 13**; preferred over rusticl when present |
+| Mesa **Clover** | `mesa-opencl-icd` (`mesa.icd`) | older AMD cards, OpenCL 1.1 | Legacy fallback only; hashcat usually rejects it ("limited"), clpeak may run |
+| AMD **ROCm** | not installed by the skill | AMD | Used if the user already installed it (`amdocl64.icd`) |
+
+Pitfalls and what the skill does about them:
+- **rusticl lists no devices unless `RUSTICL_ENABLE` is set.** `gpu.sh` exports `RUSTICL_ENABLE=radeonsi,iris` (keeping a value you set) and `RUSTICL_FEATURES=fp64` on AMD before any OpenCL call. Running clinfo by hand without it shows "0 devices" on rusticl: that is expected, not a fault.
+- **One runtime, one device.** Each ICD file in `/etc/OpenCL/vendors` is probed on its own (`OCL_ICD_VENDORS` pointing at a private copy), the device is matched by PCI address (or by vendor and position when the runtime reports no PCI address), and only that ICD stays visible to hashcat and clpeak. So an NVIDIA card in the same box, a second GPU or pocl (the CPU runtime Debian's hashcat pulls in) is never loaded by mistake. Other vendors' `.icd` files are never deleted or edited.
+- **hashcat "unstable driver / use --force"** on Mesa: retried once with `--force`, recorded as a warning. If hashcat still can't build its kernels, the stress phase falls back to clpeak's compute and bandwidth kernels in a loop (`stress_method: clpeak-loop`, a slightly burstier load) and the hashcat scores are "not available on this runtime". Neither is a hardware fault.
+- **Render node:** the runtimes need `/dev/dri/renderD*` for the card. As root the permissions are fine; a missing node (driver not fully loaded, or a headless "display-less" setup that never created it) is reported as the skip reason.
+- **Package installs are simulated first.** A runtime package is not installed if apt would pull a kernel, firmware, DKMS or microcode package, or would **upgrade** a package already on the host (for example `libgbm1`/`mesa-libgallium` when the host is behind on updates, or Mesa from backports on PVE 8). Cleanup can only remove new packages, so an upgrade would leave a trace. The plan then shows the GPU as "limited" with the reason; updating the host (`apt full-upgrade`) and re-running prep usually fixes it.
+- **Not packaged = not tested.** Intel compute-runtime is missing from Debian 13, ROCm's Debian packages cover few consumer cards (and often need `HSA_OVERRIDE_GFX_VERSION`), and Ubuntu-only repos (Intel's PPA, AMD's `amdgpu-install`) are never added. If the host's repos have nothing for the card, it stays "limited".
+- **Intel generation:** Gen7 and older (Haswell, Ivy/Sandy Bridge, Bay Trail) have no rusticl or compute-runtime support: telemetry only. **Arc on older kernels:** Arc A-series needs a recent `i915` (PVE 8's 6.5+/6.8 kernels are fine); Arc B-series (Battlemage) and Lunar Lake use the `xe` driver and need Mesa 24.1+, so on PVE 8 they are "limited". The skill never changes kernel parameters such as `i915.force_probe`.
+- **Integrated GPUs / APUs:** memory is system RAM (shared with the CPU and the guests), power is the RAPL "uncore" domain (Intel, when the CPU has it) or the whole APU package (AMD), and clocks follow the shared package power limit. The report must say "shared with the CPU" and compare bandwidth with the RAM's STREAM result.
+- **Throttling:** AMD/Intel have no NVIDIA-style throttle bitmask. `stress.stats.clock_vs_max_pct` (core clock under load vs max) plus temperature tell thermal throttling from power-limit behaviour; Intel also logs active throttle reasons (`pl1`, `thermal`, ...).
+- **Busy %:** AMD has `gpu_busy_percent` in sysfs. Intel has no sysfs counter; `intel_gpu_top` (`intel-gpu-tools`, installed with the other tools when available) supplies it, otherwise busy % is n/a and the loaded-phase statistics use every sample after the first 3 s.
+- hashcat's 90 °C abort only works when hashcat can read the card's temperature, which it often cannot on Mesa or Intel runtimes. The per-second `stress-tel.csv` (edge and junction temperature) is the record to check; if a card runs away thermally, stop the sweep as for any other error.
 
 ## 4. ZFS and the ARC
 
@@ -85,6 +109,7 @@ A missing sensor is recorded as `n/a` and never fails a test. Typical gaps:
 - **CPU temperature**: `coretemp` (Intel), `k10temp` (AMD). If missing, `modprobe coretemp`/`k10temp` may fix it, but the skill does not load modules on its own; suggest it as a recommendation.
 - **Throttle counters**: Intel only (`/sys/devices/system/cpu/cpu*/thermal_throttle`). On AMD judge throttling by clock + temperature.
 - **Disk power**: no drive reports it. Quote the datasheet's typical active power.
+- **GPU power on AMD/Intel**: discrete AMD cards report board power (`power1_average`); Intel Arc reports it through an energy counter on recent kernels; Intel iGPUs only through the CPU's RAPL "uncore" domain (missing on many CPUs, then "not measurable"); AMD APUs report the whole APU package. Intel busy % needs `intel_gpu_top`.
 - **Drive temperature behind a RAID/HBA or USB bridge**: may be unreadable.
 - **Turbostat**: used only if already installed (it is in `linux-cpupower` on Debian; prep may install it).
 - **Running inside a VM** (nested PVE): power/temperature sensors are missing and scores reflect the hypervisor. prep warns; say so in the report.
@@ -105,7 +130,7 @@ A missing sensor is recorded as `n/a` and never fails a test. Typical gaps:
 
 Stop the sweep and tell the user before running the next part when any of these appear:
 - MCE / EDAC lines or counter increases, RAM `--verify` miscompares, STREAM validation failure, memtester FAILURE: possible bad RAM, unstable XMP/EXPO, or an overclock. Suggest memtest86+ overnight and testing at JEDEC speed.
-- GPU Xid / NVRM errors: driver, power or card fault.
+- GPU Xid / NVRM errors (NVIDIA), or new amdgpu ring timeouts / GPU resets / page faults, i915 "GPU HANG" or xe job timeouts / GT resets (AMD/Intel): driver, power or card fault.
 - NVMe media errors / critical warning, SATA CRC (often a cable), reallocated or pending sectors rising, kernel I/O errors: back up first, then investigate.
 - CPU at TjMax with falling clocks (thermal throttling): cooling problem (paste, fan curve, cooler mounting, dust).
 A part that fails must be reported as FAILED even if its benchmark score was good.
@@ -125,7 +150,7 @@ The 10-minute option is the longest this skill runs per part. For a real burn-in
 |---|---|---|
 | CPU | `stress-ng --cpu <threads> --cpu-method matrixprod --timeout 60m --metrics-brief` | 30-60 min; stays below ~85-90 °C, clocks steady, 0 errors |
 | RAM | Boot **memtest86+** from the Proxmox boot menu or a USB stick | Overnight, at least 4 full passes, 0 errors. The only full-coverage RAM test |
-| GPU | the same `hashcat` stress command as `gpu.sh` with `--runtime=1800` | 30 min; below ~80-83 °C, no Xid errors |
+| GPU | the same `hashcat` stress command as `gpu.sh` with `--runtime=1800` (on AMD/Intel, with the same `RUSTICL_ENABLE` / `OCL_ICD_VENDORS` / `-d` choice recorded in `summary.json` `.opencl`) | 30 min; below ~80-83 °C (AMD junction below ~100-105 °C), no Xid / GPU hang / reset lines |
 | SSD | the same `fio` jobs with a longer `--runtime` and a test file larger than the SLC cache | 10-20 min; shows post-cache speed and sustained temperature. Mind the TBW used |
 | HDD | the same `fio` random-write job for 10+ min on the same test path (to see real SMR behaviour), plus a SMART extended self-test: `smartctl -t long /dev/sdX` | The SMART long test is read-only and runs inside the drive (hours on large disks); check `smartctl -a` afterwards. Never run `badblocks -w` (destructive) on a disk that holds data |
 
@@ -134,6 +159,7 @@ The 10-minute option is the longest this skill runs per part. For a real burn-in
 | Setup | What happens / what to do |
 |---|---|
 | **No GPU** | prep lists no GPU and installs no GPU tools; skip the GPU part and say "not present" in the report. `gpu.sh` on its own writes `status: skipped` and exits 0. |
+| **AMD or Intel GPU, iGPU or APU** | Tested like NVIDIA when the host's apt repos have an OpenCL runtime for it (section 3, "AMD and Intel GPUs"); otherwise telemetry only, with the reason. PVE 9 covers most AMD GCN/RDNA and Intel Gen8+ GPUs through Mesa rusticl; PVE 8 covers Intel (compute-runtime / rusticl) but AMD only through backports. Mixed boxes (e.g. an Intel iGPU plus an NVIDIA card) get one unit per GPU, each using only its own runtime. |
 | **GPU bound to vfio-pci** (passed through to a VM) | Never touched; prep marks it `testable: no`, and `gpu.sh` skips it even when it is named with `--gpu`. Testing it means stopping the VM and rebinding the card, which is the user's job and outside this skill. |
 | **AMD Ryzen / EPYC / Threadripper** | Power: recent kernels expose AMD RAPL under the same powercap name (`intel-rapl:0`, `package-0`, usually no `core` domain, so core W is n/a); older kernels use the `amd_energy` hwmon, which telemetry.sh reads. Temperature: `k10temp` Tdie (else Tctl). On Ryzen 1000/2000 "X" and early Threadripper, Tctl carries a +10 to +27 °C offset, so quote Tdie when present and mention the offset otherwise. No thermal-throttle counters exist on AMD: judge throttling by clock and temperature. EPYC/Threadripper have many memory channels, and the script's theoretical bandwidth assumes one DIMM per channel; check the real channel count before scoring. |
 | **Multi-socket** | One CPU unit and one RAM unit load every socket / NUMA node together. Power is summed over sockets by telemetry.sh; the CPU temperature is the hottest package. The report lists every socket in "Your hardware" and names the CPU "2 x <model>". RAM theoretical bandwidth = channels per socket x sockets. |

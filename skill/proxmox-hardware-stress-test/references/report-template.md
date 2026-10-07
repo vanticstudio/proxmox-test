@@ -21,7 +21,7 @@ The report is the product. A reader should be able to read the first screen (at-
 |---|---|
 | CPU | 7-Zip multi-thread MIPS vs a published result for the model; single-core boost clock vs advertised max turbo; thread scaling (sysbench MT / 1T, or 7-Zip MT / 1T) vs the expected scaling for the core layout |
 | RAM | STREAM Triad runs and stress-ng stream vs **typical** real-world for the platform; sysbench 1-thread sequential read vs typical single-core; DRAM latency vs typical for the platform. State the best result as % of the **theoretical** maximum on its own line too |
-| GPU | hashcat MD5 / NTLM / SHA-256 / WPA vs published results for the model; clpeak FP32 vs spec TFLOPS; clpeak VRAM bandwidth vs spec GB/s |
+| GPU | hashcat MD5 / NTLM / SHA-256 / WPA vs published results for the model; clpeak FP32 vs spec TFLOPS; clpeak VRAM bandwidth vs spec GB/s. AMD/Intel: score hashcat only against a reference from the same kind of OpenCL runtime (`.opencl.platform`: rusticl / Clover / compute-runtime / ROCm), otherwise show it unscored and rely on clpeak. Integrated GPUs (iGPU / APU): bandwidth vs the RAM's measured STREAM result, not a VRAM spec |
 | SSD / NVMe | seq read, seq write, 4K random read IOPS, 4K random write IOPS, 4K QD1 read IOPS vs the drive's datasheet (class reference only if no datasheet). Read-only (`read_only_raw`) method: the read results only |
 | HDD | sequential only (fill write, seq read, seq write) vs the datasheet sustained transfer rate. Random results are shown but not scored: a small test file flatters them, and random writes measure the drive's cache. Read-only method: seq read only; a test marked `valid: false` is excluded |
 | Pool (ZFS/mdraid) | the same results as its member type, against the pool's expected speed (e.g. mirror reads up to n x one drive, writes ~1 x); say how you derived it |
@@ -30,7 +30,7 @@ Each GPU and each disk is its own unit with its own part score and verdict. Iden
 
 **Part score** = plain average of that part's main "% of expected" values. Always show the calculation, e.g. "**CPU part score: ~97%** (7-Zip MT 96%, boost clock 99%, thread scaling ~95%)." (illustrative) Prefix with "~" because references are approximate.
 
-**Pass/fail checks** (not averaged, but they override the verdict): data integrity (stress-ng `--verify`, STREAM validation, memtester), hardware error counters (MCE, EDAC, PCIe AER, NVMe media errors, SATA CRC/reallocated/pending, GPU Xid), thermal throttling.
+**Pass/fail checks** (not averaged, but they override the verdict): data integrity (stress-ng `--verify`, STREAM validation, memtester), hardware error counters (MCE, EDAC, PCIe AER, NVMe media errors, SATA CRC/reallocated/pending, GPU Xid on NVIDIA, new GPU hang / reset / ring-timeout lines on AMD/Intel), thermal throttling.
 
 **Verdict per part:**
 
@@ -62,7 +62,7 @@ Above 100% is normal (boost behaviour, good cooling, small test areas) and not s
 The report has the **same sections in the same order on every host**; only the number of rows and per-unit sections changes.
 
 - **Units** come from `plan.json` `.units[]` in `seq` order: CPU, RAM, GPU 1..n, SSD 1..n, HDD 1..n, then any optional pool units that were run (report them with their member type, as "SSD pool 1" / "HDD pool 1"). NVMe and SATA SSDs are both "SSD" (`part: ssd`); the interface is in the label. Physical disks hidden behind a hardware RAID controller appear as skipped rows ("tested through the RAID volume").
-- **Naming** (use it everywhere: table rows, section headings, recommendations): `CPU: <model>` (with "2 x" for two identical sockets), `RAM: <n> x <size> <type>-<speed>`, `GPU 1: <model> (<PCI slot>)`, `SSD 1: <model> (<dev>)`, `HDD 2: <model> (<dev>)`, `SSD pool 1: <pool name> (<layout>, <n> x <model>)`. Numbering follows the plan, not the device name.
+- **Naming** (use it everywhere: table rows, section headings, recommendations): `CPU: <model>` (with "2 x" for two identical sockets), `RAM: <n> x <size> <type>-<speed>`, `GPU 1: <model> (<PCI slot>)` (add "integrated" for an iGPU / APU, e.g. `GPU 1: Intel UHD Graphics 770 (integrated, 00:02.0)`), `SSD 1: <model> (<dev>)`, `HDD 2: <model> (<dev>)`, `SSD pool 1: <pool name> (<layout>, <n> x <model>)`. Numbering follows the plan, not the device name.
 - **At a glance:** one row per unit; a skipped unit keeps its row with "Skipped: <reason>" in the score column and "-" elsewhere. A part the host doesn't have at all is a single row with "Not present" (e.g. `| **GPU** | Not present | - | - | - | - |`).
 - **Per-unit sections:** every tested unit gets the full sub-section set (what and why, stress phase, scores, part score, health before/after, "Is it running optimally?", recommendations). A skipped unit gets a two-line section with the reason and what would be needed to test it. With more than ~6 identical disks, you may merge their sections into one comparison table plus full sections only for the outliers; say that you did.
 - **Your hardware** lists *every* component, tested or not: every socket, every DIMM slot (empty ones too), every GPU, every controller and the disks behind it, every NIC.
@@ -124,9 +124,9 @@ Everything Claude found on the host, tested or not. Serial numbers, MAC addresse
 | <slot name> | empty | - | - | - |
 
 ### GPUs (<n> found)
-| # | Model | PCI slot | Driver | VRAM | PCIe link max | Power limit | Tested? |
-|---|---|---|---|---|---|---|---|
-| GPU 1 | <model> | <slot> | <driver + version> | <n> GB | Gen<n> x<n> | <n> W | Yes / No: <reason> |
+| # | Model | Type | PCI slot | Driver / OpenCL runtime | VRAM | PCIe link max | Power limit | Tested? |
+|---|---|---|---|---|---|---|---|---|
+| GPU 1 | <model> | discrete / integrated | <slot> | <driver + version> / <runtime, e.g. Mesa rusticl> | <n> GB, or "shared RAM" | Gen<n> x<n> | <n> W | Yes / Limited: <reason> / No: <reason> |
 <or the single line "No GPU found.">
 
 ### Storage controllers and disks (<n> controllers, <n> disks)
@@ -182,7 +182,7 @@ Everything Claude found on the host, tested or not. Serial numbers, MAC addresse
 <Same sub-sections. Stress table: memory in use, swap, CPU package W/°C, clock, throttle. The result line must state the size actually tested and the error count. Scores: each STREAM run, stress-ng stream, latency (+ L1/L2/L3 ladder), sysbench 1T, memtester; list invalid results as "Invalid - excluded from scoring" with the reason. Explain ECC vs non-ECC and what that means for catching errors.>
 
 ## 3.1 GPU 1: <model> (<PCI slot>)        (repeat as 3.2 GPU 2, 3.3 GPU 3 ...; "## 3. GPU: not present" when there is none; "## 3.n GPU n: <model>, skipped" + reason)
-<Stress table: power vs limit, temp, graphics/memory clock, utilisation, fan, VRAM, PCIe link idle vs load, throttle reason. Scores: hashcat modes, clpeak FP32 / FP64 / INT32 / VRAM bandwidth / PCIe transfer / kernel latency.>
+<Vendor, discrete or integrated, and how it was driven: "NVIDIA driver <version>, OpenCL" or "in-kernel amdgpu/i915/xe driver, OpenCL through <runtime> (`.opencl.platform`)"; say if the stress used the clpeak fallback (`stress_method: clpeak-loop`) and why. Stress table: power vs limit, temp (AMD: edge and junction/hotspot, memory), graphics/memory clock (AMD/Intel: average vs max, `clock_vs_max_pct`), utilisation, fan, VRAM (iGPU/APU: "shared system RAM"), PCIe link idle vs load (n/a for an iGPU), throttle reason (NVIDIA bitmask; Intel throttle reasons; AMD: judged from clock vs max + temperature). For an iGPU / APU, label power "shared with the CPU" (`power_note`) and don't compare it with a discrete card. Scores: hashcat modes (or "not available on this OpenCL runtime"), clpeak FP32 / FP64 / INT32 / memory bandwidth / PCIe transfer / kernel latency. Limited GPUs (telemetry only): a short section with the idle/loaded sensor readings and the reason no OpenCL runtime was usable.>
 
 ## 4.1 SSD 1: <model> (<dev>), <capacity>, <NVMe|SATA|SAS>, <role>        (repeat as 4.2 SSD 2 ...; pools as "SSD pool 1"; "## 4. SSD: not present")
 <Method (write+read with the test-file size and path, or read-only: whole disk, no write scores). Controller it sits behind. Stress table: throughput per phase, temp (+ controller), power state, host CPU power, throttling, sustain ratio on long runs. Scores vs datasheet. Health table before/after: SMART, temp, wear/spare, media errors, unsafe shutdowns, data written. PCIe or SATA link under load. Firmware notes.>
@@ -233,12 +233,12 @@ Everything Claude found on the host, tested or not. Serial numbers, MAC addresse
 | Report item | Source |
 |---|---|
 | Hardware, settings, guests, idle readings | `hardware.json`, `00-baseline/summary.json`, `00-baseline/*.txt`, `00-baseline/idle-telemetry.csv` |
-| Your hardware section | `inventory.json` (or the ready-made tables in `inventory.md`), which is already report-safe: no hostname, no IPs, serials/MACs masked. Keys: `.system`, `.board`, `.bios`, `.platform` (IOMMU, NUMA), `.cpu.sockets[]` (+ `.cpu.sockets_empty[]`), `.memory.slots[]` (empty slots have `populated: false`), `.gpus[]` (`testable`, `reason`, `passthrough_vms`, `shared_with_containers`), `.storage.controllers[]` (with `.disks`), `.storage.disks[]` (`usage[]`, `smart`, `interface`, `rotation`), `.storage.raid_hidden_disks[]`, `.nics[]`, `.sensors`. Don't use `hardware.json` for this section: it holds full serials and the hostname |
+| Your hardware section | `inventory.json` (or the ready-made tables in `inventory.md`), which is already report-safe: no hostname, no IPs, serials/MACs masked. Keys: `.system`, `.board`, `.bios`, `.platform` (IOMMU, NUMA), `.cpu.sockets[]` (+ `.cpu.sockets_empty[]`), `.memory.slots[]` (empty slots have `populated: false`), `.gpus[]` (`testable`, `reason`, `integrated`, `opencl` runtime/state, `passthrough_vms`, `shared_with_containers`), `.storage.controllers[]` (with `.disks`), `.storage.disks[]` (`usage[]`, `smart`, `interface`, `rotation`), `.storage.raid_hidden_disks[]`, `.nics[]`, `.sensors`. Don't use `hardware.json` for this section: it holds full serials and the hostname |
 | Unit list, labels, methods, skips | `plan.json` `.units[]` (`seq`, `label`, `part`, `method_id`/`method`, `path`/`device`, `status` test/skip, `reason`, `needs_confirmation`, `optional`); `.inventory_only[]` for NICs/controllers; `.estimate` for timing |
 | CPU stress table | `01-cpu/summary.json` `.idle`, `.stress`, `.peaks`, `.throttle`; per-second detail in `telemetry-1s.csv` (phase `stress`) |
 | CPU scores | `.benchmarks` (sysbench, 7-Zip), `.efficiency`, `.scores[]` (boost % is already computed) |
 | RAM | `02-ram/summary.json`: `.stress.tested_mib` (use this, not the planned size), `.stream[]` (skip `valid: false`), `.stress_ng_stream`, `.sysbench`, `.latency.dram_ns` + ladder, `.memtester.state`, `.edac`, `.data_integrity`, `.host.theoretical_gbs_one_dimm_per_channel` (check the real channel count: 4 DIMMs on a 2-channel desktop is still 2 channels) |
-| GPU | each GPU unit's `03-gpu*/summary.json` `.scores` (hashcat `value`+`unit`, clpeak best-of-vector-width), `.stress.stats` (loaded temp/power/SM clock avg-max), `.xid_lines_before/after`; `stress-tel.csv` for per-second detail; `clpeak.txt` for FP64/INT32/transfer/latency; `pre-/post-health.txt` for Xid |
+| GPU | each GPU unit's `03-gpu*/summary.json`: `.vendor`, `.gpu_type` (discrete/integrated), `.power_note`, `.opencl` (platform, device, ICD, how it was matched; or `skip_reason`), `.stress.method` / `.stress_method` (hashcat / clpeak-loop / none), `.scores` (hashcat `value`+`unit`, clpeak best-of-vector-width), `.stress.stats` (loaded temp/power/core clock avg-min; AMD/Intel also `core_max_mhz`, `clock_vs_max_pct`, `junction_c_max`, `mem_temp_c_max`, `throttle_samples`, `power_source`, `util_filter`), `.xid_lines_before/after` (NVIDIA) or `.gpu_error_lines_before/after` (AMD/Intel); `stress-tel.csv` for per-second detail (AMD/Intel columns: `telemetry.sh` `TEL_GPU_EXT_FIELDS`); `clpeak.txt` for FP64/INT32/transfer/latency; `pre-/post-health.txt`; `opencl-probe.txt` for which runtimes were tried |
 | SSD / HDD | each unit's `out` folder (`04-ssd-*`, `05-hdd-*`) `summary.json`: `.tests[]` (MBps, IOPS, latency, sustain_ratio, zfs_arc_hit_pct), `.telemetry`, `.smart.counters_pre/post`, `.link`, `.zfs`, `.bytes_written`. The script's own `pct_of_expected` uses class references; replace them with datasheet values when you have them |
 | Errors and warnings | every `summary.json` `.errors`, `.warnings`, `.skipped`; `dmesg-new-hw-errors.txt` |
 

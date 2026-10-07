@@ -61,7 +61,41 @@
 #   gpu_query [IDX]          10 fields, in TEL_GPU_FIELDS order:
 #                            temp_c,power_w,core_mhz,mem_mhz,util_pct,
 #                            mem_used_mib,fan_pct,throttle,pstate,power_limit_w
-#                            (NVIDIA via nvidia-smi; AMD/Intel via sysfs).
+#                            (NVIDIA via nvidia-smi; AMD/Intel via sysfs/hwmon,
+#                            derived from gpu_query_ext; pstate is n/a there).
+#   gpu_query_ext IDX        AMD/Intel only (NVIDIA: all n/a): 17 fields in
+#                            TEL_GPU_EXT_FIELDS order:
+#                            temp_c,power_w,sclk_mhz,busy_pct,vram_used_mib,
+#                            fan_rpm,pcie_link,junction_c,mem_temp_c,mclk_mhz,
+#                            max_mhz,mem_busy_pct,gtt_used_mib,fan_pct,
+#                            power_limit_w,power_source,throttle
+#                            amdgpu: hwmon temp1/2/3 (edge/junction/mem), power1_
+#                            average|input (uW), power1_cap, freq1/2_input or
+#                            pp_dpm_sclk/mclk, gpu_busy_percent, mem_busy_percent,
+#                            mem_info_vram_used / gtt_used, fan1_input, pwm1.
+#                            i915: gt_act_freq_mhz / gt_max_freq_mhz, gt/gt0/
+#                            throttle_reason_*; xe: tile*/gt*/freq*/act_freq,
+#                            max_freq, throttle/reason_*; hwmon power1_* or the
+#                            energy1_input counter (uJ, averaged between calls).
+#                            Integrated Intel GPUs without hwmon: RAPL "uncore"
+#                            energy (power_source says "shared with CPU"); AMD
+#                            APUs: hwmon power is the whole APU package (also
+#                            marked shared). AMD/Intel expose no NVIDIA-style
+#                            throttle bitmask: "throttle" is the list of active
+#                            Intel throttle reasons (e.g. pl1|thermal), "none",
+#                            or n/a (AMD); judge AMD by sclk vs max_mhz + temp.
+#                            busy_pct on Intel comes only from the optional
+#                            gpu_util_helper_start (intel_gpu_top), else n/a.
+#   gpu_index_for_pci ADDR   Telemetry index of the GPU at PCI ADDR (empty if none).
+#   gpu_is_integrated_pci ADDR [NAME]
+#                            Prints 1 for an integrated GPU (Intel iGPU at
+#                            00:02.0; AMD APU by lspci code name, or <= 1 GiB
+#                            VRAM carve-out), else 0.
+#   gpu_util_helper_start IDX FILE / gpu_util_helper_stop
+#                            Optional busy-% helper, used only if installed:
+#                            intel_gpu_top -J (Intel) or radeontop (AMD, only
+#                            when gpu_busy_percent is missing). gpu_query /
+#                            gpu_query_ext read its latest sample from FILE.
 #
 # Disks (DEV = sda | nvme0n1 | /dev/sda ...)
 #   disk_temp DEV            Temperature in C (integer) or n/a. NVMe/drivetemp
@@ -128,9 +162,18 @@
 #   TEL_RAPL_SRC  TEL_CPU_TEMP_SRC  TEL_HYBRID(0/1)  TEL_PCORES TEL_ECORES
 #   TEL_SOCKETS (count)  TEL_SOCKET_IDS[] (physical package ids, sorted)
 #   TEL_RAPL_PKG_SOCK[] / TEL_CPU_TEMP_SOCK[] (socket id of each sensor file)
-#   TEL_GPU_KINDS[] TEL_GPU_IDS[] TEL_GPU_NAMES[]  TEL_STATE_DIR
+#   TEL_GPU_KINDS[] TEL_GPU_IDS[] TEL_GPU_NAMES[] TEL_GPU_PCI[]
+#   TEL_GPU_INTEGRATED[] (1/0)  TEL_STATE_DIR  TEL_RAPL_UNCORE (path or "")
 #   TEL_GPU_FIELDS  (the 10 gpu_query column names)
+#   TEL_GPU_EXT_FIELDS (the 17 gpu_query_ext column names)
 #   STRESS_HOME (default /root/pve-stresstest; override before sourcing)
+#   TEL_ROOT  "" on a real host (see the developer-only hook below)
+#
+# DEVELOPER-ONLY test hook (never set on a real host): PVE_STRESS_SYSFS_ROOT=DIR
+# makes the GPU and RAPL sysfs reads (GPU detection, gpu_query_ext,
+# gpu_is_integrated_pci, RAPL incl. "uncore") read DIR/sys/... instead of /sys/...,
+# so the AMD/Intel GPU code can be exercised against a fake sysfs tree on any
+# machine. Reads only; unset or "/" = the real /sys. See docs/developing.md.
 #
 # Cost: one sample of all groups takes ~50-200 ms (smartctl on SATA disks
 # and nvidia-smi dominate). Nothing here runs for a fixed time by itself.
@@ -144,10 +187,14 @@ _TEL_SOURCED=1
 TEL_TESTFILE_PREFIX="pve-stresstest-fio"
 TEL_NA="n/a"
 TEL_GPU_FIELDS="temp_c,power_w,core_mhz,mem_mhz,util_pct,mem_used_mib,fan_pct,throttle,pstate,power_limit_w"
+TEL_GPU_EXT_FIELDS="temp_c,power_w,sclk_mhz,busy_pct,vram_used_mib,fan_rpm,pcie_link,junction_c,mem_temp_c,mclk_mhz,max_mhz,mem_busy_pct,gtt_used_mib,fan_pct,power_limit_w,power_source,throttle"
+TEL_GPU_UTIL_PID="" TEL_GPU_UTIL_FILE="" TEL_GPU_UTIL_IDX=""
 TEL_WARNINGS=()
 TEL_ERRORS=()
 TEL_SKIPPED=()
 TEL_SAMPLER_PID=""
+# Developer-only fake root for GPU/RAPL sysfs reads (see header); "" = the real /.
+TEL_ROOT=${PVE_STRESS_SYSFS_ROOT:-}; TEL_ROOT=${TEL_ROOT%/}
 # Deterministic per-script state dir ($$ is the same in all subshells).
 TEL_STATE_DIR="${TEL_STATE_DIR:-/tmp/pve-stresstest-tel.$$}"
 
@@ -213,8 +260,9 @@ _tel_detect_sockets() {
 
 _tel_detect_rapl() {
     TEL_RAPL_PKG=(); TEL_RAPL_PKG_MAX=(); TEL_RAPL_PKG_SOCK=(); TEL_RAPL_CORE=(); TEL_RAPL_CORE_MAX=(); TEL_RAPL_SRC="n/a"
+    TEL_RAPL_UNCORE=""; TEL_RAPL_UNCORE_MAX=0
     local z name v mx h l lab
-    for z in /sys/class/powercap/intel-rapl:[0-9]*; do
+    for z in "$TEL_ROOT"/sys/class/powercap/intel-rapl:[0-9]*; do
         [[ -d $z ]] || continue
         v=$(_tel_read "$z/energy_uj") || continue
         _tel_isnum "$v" || continue
@@ -225,11 +273,13 @@ _tel_detect_rapl() {
             package-*) TEL_RAPL_PKG+=("$z/energy_uj"); TEL_RAPL_PKG_MAX+=("$mx")
                        v=${name#package-}; v=${v%%-*}; [[ $v =~ ^[0-9]+$ ]] || v=0; TEL_RAPL_PKG_SOCK+=("$v") ;;
             core)      TEL_RAPL_CORE+=("$z/energy_uj"); TEL_RAPL_CORE_MAX+=("$mx") ;;
+            # client Intel CPUs: the integrated GPU's share of the package (first one only)
+            uncore)    [[ -z $TEL_RAPL_UNCORE ]] && { TEL_RAPL_UNCORE="$z/energy_uj"; TEL_RAPL_UNCORE_MAX=$mx; } ;;
         esac
     done
     if ((${#TEL_RAPL_PKG[@]})); then TEL_RAPL_SRC="powercap-rapl"; return 0; fi
     # Older AMD kernels: amd_energy hwmon (uJ, 64-bit accumulated, no wrap handling needed)
-    for h in /sys/class/hwmon/hwmon*; do
+    for h in "$TEL_ROOT"/sys/class/hwmon/hwmon*; do
         [[ $(_tel_read "$h/name") == amd_energy ]] || continue
         for l in "$h"/energy*_label; do
             [[ -r $l ]] || continue
@@ -326,27 +376,61 @@ _tel_detect_hybrid() {
 }
 
 _tel_detect_gpus() {
-    TEL_GPU_KINDS=(); TEL_GPU_IDS=(); TEL_GPU_NAMES=(); TEL_NV_THR="clocks_throttle_reasons.active"
-    local line idx name c vendor drv
+    TEL_GPU_KINDS=(); TEL_GPU_IDS=(); TEL_GPU_NAMES=(); TEL_GPU_PCI=(); TEL_GPU_INTEGRATED=(); TEL_NV_THR="clocks_throttle_reasons.active"
+    local line idx name c vendor drv bus pci
     if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
-        while IFS=, read -r idx name; do
-            idx=${idx// /}; name=${name# }
+        while IFS=, read -r idx bus name; do
+            idx=${idx// /}; name=${name# }; bus=${bus// /}
             [[ -n $idx ]] || continue
-            TEL_GPU_KINDS+=(nvidia); TEL_GPU_IDS+=("$idx"); TEL_GPU_NAMES+=("$name")
-        done < <(nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null)
+            bus=${bus,,}; [[ $bus =~ ^[0-9a-f]{8}: ]] && bus=${bus#????}
+            TEL_GPU_KINDS+=(nvidia); TEL_GPU_IDS+=("$idx"); TEL_GPU_NAMES+=("$name"); TEL_GPU_PCI+=("$bus"); TEL_GPU_INTEGRATED+=(0)
+        done < <(nvidia-smi --query-gpu=index,pci.bus_id,name --format=csv,noheader 2>/dev/null)
         if nvidia-smi --query-gpu=clocks_event_reasons.active --format=csv,noheader >/dev/null 2>&1; then
             TEL_NV_THR="clocks_event_reasons.active"
         fi
     fi
-    for c in /sys/class/drm/card*; do
+    for c in "$TEL_ROOT"/sys/class/drm/card*; do
         [[ $c =~ /card[0-9]+$ ]] || continue
         vendor=$(_tel_read "$c/device/vendor") || continue
         drv=$(basename "$(readlink -f "$c/device/driver" 2>/dev/null)" 2>/dev/null)
+        pci=$(basename "$(readlink -f "$c/device" 2>/dev/null)" 2>/dev/null)
         case "$vendor:$drv" in
             0x1002:amdgpu) TEL_GPU_KINDS+=(amd);   TEL_GPU_IDS+=("$c"); TEL_GPU_NAMES+=("AMD GPU ${c##*/}") ;;
             0x8086:i915|0x8086:xe) TEL_GPU_KINDS+=(intel); TEL_GPU_IDS+=("$c"); TEL_GPU_NAMES+=("Intel GPU ${c##*/} ($drv)") ;;
+            *) continue ;;
         esac
+        TEL_GPU_PCI+=("$pci"); TEL_GPU_INTEGRATED+=("$(gpu_is_integrated_pci "$pci")")
     done
+    return 0
+}
+
+# 1 if the GPU at PCI address $1 is integrated (shares RAM and power with the CPU), else 0.
+# Intel: the iGPU always sits at 0000:00:02.0 (Arc cards are elsewhere). AMD: APU code
+# names in the lspci name ($2, or looked up), else a VRAM carve-out of <= 1 GiB.
+gpu_is_integrated_pci() {
+    local a=${1:-} name=${2:-} d v vt
+    d="$TEL_ROOT/sys/bus/pci/devices/$a"
+    v=$(_tel_read "$d/vendor") || { echo 0; return 0; }
+    case $v in
+        0x8086) [[ $a == 0000:00:02.0 ]] && echo 1 || echo 0; return 0 ;;
+        0x1002) ;;
+        *) echo 0; return 0 ;;
+    esac
+    [[ -z $name ]] && command -v lspci >/dev/null 2>&1 && name=$(lspci -s "$a" 2>/dev/null | head -n1)
+    if [[ $name =~ (Renoir|Cezanne|Lucienne|Barcelo|Rembrandt|Phoenix|Hawk[[:space:]]Point|Raphael|Granite[[:space:]]Ridge|Strix|Krackan|Mendocino|Picasso|Raven|Van[[:space:]]Gogh|Dali|Pollock|Stoney|Carrizo|Kaveri|Kabini|Mullins|Beema|Godavari|Cyan[[:space:]]Skillfish|Vega[[:space:]]Mobile|Radeon[[:space:]][678][0-9]0M|Radeon[[:space:]]8060S) ]]; then
+        echo 1; return 0
+    fi
+    vt=$(_tel_read "$d/mem_info_vram_total") || vt=""
+    if _tel_isnum "$vt" && ((vt > 0 && vt <= 1073741824)); then echo 1; else echo 0; fi
+}
+
+# Telemetry index of the GPU at PCI address $1 (any form: 01:00.0, 0000:01:00.0).
+gpu_index_for_pci() {
+    tel_init
+    local a=${1:-} i
+    a=${a,,}
+    [[ $a =~ ^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]] && a="0000:$a"
+    for i in "${!TEL_GPU_PCI[@]}"; do [[ ${TEL_GPU_PCI[$i]} == "$a" ]] && { echo "$i"; return 0; }; done
     return 0
 }
 
@@ -496,10 +580,185 @@ gpu_query() {
     kind=${TEL_GPU_KINDS[$idx]}; id=${TEL_GPU_IDS[$idx]}
     case $kind in
         nvidia) _tel_gpu_nvidia "$id" ;;
-        amd)    _tel_gpu_amd "$id" ;;
-        intel)  _tel_gpu_intel "$id" ;;
+        amd|intel) _tel_gpu_from_ext "$idx" ;;
         *)      echo "$_TEL_GPU_NA" ;;
     esac
+}
+
+_TEL_GPU_EXT_NA="n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a,n/a"
+gpu_query_ext() {
+    tel_init
+    local idx=${1:-}
+    if ! [[ $idx =~ ^[0-9]+$ ]] || ((idx >= ${#TEL_GPU_KINDS[@]})); then echo "$_TEL_GPU_EXT_NA"; return 0; fi
+    case ${TEL_GPU_KINDS[$idx]} in
+        amd|intel) _tel_gpu_ext "$idx" ;;
+        *) echo "$_TEL_GPU_EXT_NA" ;;
+    esac
+}
+
+# The 10 gpu_query fields for an AMD/Intel GPU, mapped from the 17 extended ones.
+_tel_gpu_from_ext() {
+    local e; local -a f
+    e=$(_tel_gpu_ext "$1")
+    IFS=, read -r -a f <<<"$e"
+    # temp, power, core MHz, mem MHz, util, VRAM used, fan %, throttle, pstate, power limit
+    echo "${f[0]:-n/a},${f[1]:-n/a},${f[2]:-n/a},${f[9]:-n/a},${f[3]:-n/a},${f[4]:-n/a},${f[13]:-n/a},${f[16]:-n/a},n/a,${f[14]:-n/a}"
+}
+
+# Average W from a cumulative energy counter in uJ (hwmon energy1_input, RAPL energy_uj)
+# since the previous call with the same KEY; first call prints n/a. $3 = wrap value (0 = none).
+_tel_energy_w() {
+    local key=$1 f=$2 mx=${3:-0} st now v prev=""
+    v=$(_tel_read "$f") || { echo n/a; return 0; }
+    _tel_isnum "$v" || { echo n/a; return 0; }
+    st="$TEL_STATE_DIR/energy.${TEL_TAG:-main}.$key"
+    now=$(_tel_now)
+    [[ -r $st ]] && prev=$(<"$st")
+    printf '%s %s\n' "$now" "$v" > "$st" 2>/dev/null
+    [[ -n $prev ]] || { echo n/a; return 0; }
+    awk -v c="$now $v" -v p="$prev" -v m="$mx" 'BEGIN{ split(c,a," "); split(p,b," "); dt=a[1]-b[1]; d=a[2]-b[2];
+        if(d<0 && m>0) d+=m; if(dt<=0 || d<0){ print "n/a"; exit } printf "%.1f\n", d/dt/1e6 }'
+}
+
+# Active Intel throttle reasons from DIR (status file ST, reason files PRE*): "pl1|thermal", "none" or n/a.
+_tel_intel_throttle() {
+    local dir=$1 pre=$2 st=$3 s f n out=""
+    s=$(_tel_read "$dir/$st") || { echo n/a; return 0; }
+    [[ $s == 0 ]] && { echo none; return 0; }
+    for f in "$dir/$pre"*; do
+        [[ -r $f ]] || continue
+        n=${f##*/}; n=${n#"$pre"}
+        [[ $n == status || $f == "$dir/$st" ]] && continue
+        [[ $(_tel_read "$f") == 1 ]] && out+="${out:+|}$n"
+    done
+    echo "${out:-active}"
+}
+
+# Latest busy % from the optional helper (intel_gpu_top -J / radeontop dump), or n/a.
+_tel_util_from_helper() {
+    local idx=$1 f=${TEL_GPU_UTIL_FILE:-} v=""
+    [[ -n $f && ${TEL_GPU_UTIL_IDX:-} == "$idx" && -s $f ]] || { echo n/a; return 0; }
+    if [[ ${TEL_GPU_KINDS[$idx]} == intel ]]; then
+        # max engine busy of the last (possibly partial) sample
+        v=$(tail -c 8192 "$f" 2>/dev/null | awk '/"engines"/{m=-1; on=1; next}
+            on && /"busy"/{ x=$0; sub(/.*"busy"[^0-9]*/,"",x); x+=0; if(x>m) m=x }
+            END{ if(on && m>=0) printf "%.0f", m }')
+    else
+        v=$(tail -n 1 "$f" 2>/dev/null | sed -n 's/.*gpu \([0-9.]*\)%.*/\1/p' | awk '{printf "%.0f", $1}')
+    fi
+    echo "${v:-n/a}"
+}
+
+# Optional background busy-% helper (only if the tool is installed; never installs it).
+gpu_util_helper_start() {
+    tel_init
+    local idx=${1:-} file=${2:-} c pci bus ni=0 k
+    gpu_util_helper_stop
+    [[ $idx =~ ^[0-9]+$ && -n $file ]] || return 0
+    ((idx < ${#TEL_GPU_KINDS[@]})) || return 0
+    c=${TEL_GPU_IDS[$idx]}; pci=${TEL_GPU_PCI[$idx]:-}
+    case ${TEL_GPU_KINDS[$idx]} in
+        intel)
+            command -v intel_gpu_top >/dev/null 2>&1 || return 0
+            intel_gpu_top -J -s 1000 -d "drm:/dev/dri/${c##*/}" > "$file" 2>/dev/null &
+            TEL_GPU_UTIL_PID=$!
+            sleep 1.5
+            if ! kill -0 "$TEL_GPU_UTIL_PID" 2>/dev/null; then
+                # older intel-gpu-tools without device filters: only safe with one Intel GPU
+                for k in "${TEL_GPU_KINDS[@]}"; do [[ $k == intel ]] && ni=$((ni + 1)); done
+                TEL_GPU_UTIL_PID=""
+                if ((ni == 1)); then intel_gpu_top -J -s 1000 > "$file" 2>/dev/null & TEL_GPU_UTIL_PID=$!; fi
+            fi ;;
+        amd)
+            [[ -r $c/device/gpu_busy_percent ]] && return 0      # sysfs already has it
+            command -v radeontop >/dev/null 2>&1 || return 0
+            bus=${pci#*:}; bus=${bus%%:*}
+            radeontop -d "$file" -i 1 -b "${bus:-0}" > /dev/null 2>&1 &
+            TEL_GPU_UTIL_PID=$! ;;
+        *) return 0 ;;
+    esac
+    [[ -n $TEL_GPU_UTIL_PID ]] && { TEL_GPU_UTIL_FILE=$file; TEL_GPU_UTIL_IDX=$idx; }
+    return 0
+}
+gpu_util_helper_stop() {
+    if [[ -n ${TEL_GPU_UTIL_PID:-} ]]; then
+        kill "$TEL_GPU_UTIL_PID" 2>/dev/null
+        wait "$TEL_GPU_UTIL_PID" 2>/dev/null
+        TEL_GPU_UTIL_PID=""
+    fi
+    TEL_GPU_UTIL_FILE="" TEL_GPU_UTIL_IDX=""     # no stale busy % after the helper stopped
+    return 0
+}
+
+# AMD/Intel sensors from sysfs/hwmon -> the 17 TEL_GPU_EXT_FIELDS. Missing -> n/a.
+_tel_gpu_ext() {
+    local idx=$1 c d h="" f l lab v key kind integ
+    local t=n/a jt=n/a mt=n/a p=n/a ps=n/a cm="" mx="" mm="" u=n/a mu=n/a vu=n/a gu=n/a fr=n/a fp=n/a pl=n/a link=n/a thr=n/a
+    kind=${TEL_GPU_KINDS[$idx]}; c=${TEL_GPU_IDS[$idx]}; d="$c/device"; integ=${TEL_GPU_INTEGRATED[$idx]:-0}
+    key=${TEL_GPU_PCI[$idx]:-gpu$idx}; key=${key//[:.]/_}
+    for f in "$d"/hwmon/hwmon*; do [[ -d $f ]] && { h=$f; break; }; done
+    if [[ -n $h ]]; then
+        for l in "$h"/temp*_label; do
+            [[ -r $l ]] || continue
+            lab=$(_tel_read "$l") || continue
+            v=$(_tel_div "$(_tel_read "${l%_label}_input")" 1000 0)
+            [[ $v == n/a ]] && continue
+            case ${lab,,} in
+                edge|pkg|package|gpu) [[ $t == n/a ]] && t=$v ;;
+                junction|hotspot)     jt=$v ;;
+                mem|vram)             mt=$v ;;
+            esac
+        done
+        [[ $t == n/a ]] && t=$(_tel_div "$(_tel_read "$h/temp1_input")" 1000 0)
+        if v=$(_tel_read "$h/power1_average") && _tel_isnum "$v" && [[ $v != 0 ]]; then p=$(_tel_div "$v" 1000000 1); ps=hwmon
+        elif v=$(_tel_read "$h/power1_input") && _tel_isnum "$v"; then p=$(_tel_div "$v" 1000000 1); ps=hwmon
+        elif [[ -r $h/energy1_input ]]; then p=$(_tel_energy_w "gpu$key" "$h/energy1_input"); ps=hwmon-energy
+        fi
+        v=$(_tel_read "$h/power1_cap") || v=$(_tel_read "$h/power1_max") || v=""
+        pl=$(_tel_div "$v" 1000000 0); [[ $pl == 0 ]] && pl=n/a
+        fr=$(_tel_read "$h/fan1_input") || fr=n/a
+        if v=$(_tel_read "$h/pwm1") && [[ $v =~ ^[0-9]+$ ]]; then fp=$(_tel_div "$((v * 100))" 255 0); fi
+    fi
+    case $kind in
+        amd)
+            v=$(_tel_read "$h/freq1_input") && cm=$(_tel_div "$v" 1000000 0)
+            [[ -n $cm && $cm != n/a ]] || cm=$(awk '/\*/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$d/pp_dpm_sclk" 2>/dev/null)
+            mx=$(awk 'NF>=2{x=$2} END{gsub(/[^0-9]/,"",x); print x}' "$d/pp_dpm_sclk" 2>/dev/null)
+            v=$(_tel_read "$h/freq2_input") && mm=$(_tel_div "$v" 1000000 0)
+            [[ -n $mm && $mm != n/a ]] || mm=$(awk '/\*/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$d/pp_dpm_mclk" 2>/dev/null)
+            u=$(_tel_read "$d/gpu_busy_percent") || u=n/a
+            mu=$(_tel_read "$d/mem_busy_percent") || mu=n/a
+            vu=$(_tel_div "$(_tel_read "$d/mem_info_vram_used")" 1048576 0)
+            gu=$(_tel_div "$(_tel_read "$d/mem_info_gtt_used")" 1048576 0)
+            [[ $p != n/a && $integ == 1 ]] && ps="hwmon (APU package; shared with CPU)"
+            ;;
+        intel)
+            cm=$(_tel_read "$c/gt_act_freq_mhz") || cm=$(_tel_read "$c/gt_cur_freq_mhz") || cm=""
+            mx=$(_tel_read "$c/gt_max_freq_mhz") || mx=$(_tel_read "$c/gt_RP0_freq_mhz") || mx=""
+            if [[ -z $cm ]]; then
+                for f in "$d"/tile*/gt*/freq*/act_freq; do
+                    [[ -r $f ]] || continue
+                    cm=$(_tel_read "$f"); mx=$(_tel_read "${f%/*}/max_freq") || mx=$(_tel_read "${f%/*}/rp0_freq") || mx=""
+                    break
+                done
+            fi
+            if [[ -r $c/gt/gt0/throttle_reason_status ]]; then thr=$(_tel_intel_throttle "$c/gt/gt0" throttle_reason_ throttle_reason_status)
+            else
+                for f in "$d"/tile*/gt*/freq*/throttle; do
+                    [[ -r $f/status ]] && { thr=$(_tel_intel_throttle "$f" reason_ status); break; }
+                done
+            fi
+            u=$(_tel_util_from_helper "$idx")
+            if [[ $ps == n/a && $integ == 1 && -n ${TEL_RAPL_UNCORE:-} ]]; then
+                p=$(_tel_energy_w "uncore" "$TEL_RAPL_UNCORE" "${TEL_RAPL_UNCORE_MAX:-0}"); ps="rapl-uncore (shared with CPU package)"
+            fi
+            ;;
+    esac
+    [[ $u == n/a && $kind == amd ]] && u=$(_tel_util_from_helper "$idx")
+    # integrated GPUs (root-complex endpoints) report "Unknown" / x0: no PCIe link to show
+    v=$(_tel_read "$d/current_link_speed") && [[ $v != Unknown* ]] && link="$v x$(_tel_read "$d/current_link_width" || echo '?')"
+    link=${link//,/;}
+    echo "${t:-n/a},${p:-n/a},${cm:-n/a},${u:-n/a},${vu:-n/a},${fr:-n/a},${link:-n/a},${jt:-n/a},${mt:-n/a},${mm:-n/a},${mx:-n/a},${mu:-n/a},${gu:-n/a},${fp:-n/a},${pl:-n/a},${ps:-n/a},${thr:-n/a}"
 }
 
 _tel_gpu_nvidia() {
@@ -509,31 +768,6 @@ _tel_gpu_nvidia() {
     if [[ -z $out ]]; then echo "$_TEL_GPU_NA"; return 0; fi
     awk -F',' '{ for(i=1;i<=10;i++){ g=$i; gsub(/^[ \t]+|[ \t]+$/,"",g);
         if(g==""||g~/N\/A|Not Supported|Unknown|Error|\[/) g="n/a"; printf "%s%s",(i>1?",":""),g } print "" }' <<<"$out"
-}
-
-_tel_gpu_amd() {
-    local c=$1 d="$1/device" h t p cm mm u vu f pl v
-    h=$(ls -d "$d"/hwmon/hwmon* 2>/dev/null | head -n1)
-    t=$(_tel_div "$(_tel_read "$h/temp1_input")" 1000 0)
-    v=$(_tel_read "$h/power1_average") || v=$(_tel_read "$h/power1_input") || v=""
-    p=$(_tel_div "$v" 1000000 1)
-    v=$(_tel_read "$h/freq1_input") && cm=$(_tel_div "$v" 1000000 0) ||
-        cm=$(awk '/\*/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$d/pp_dpm_sclk" 2>/dev/null)
-    v=$(_tel_read "$h/freq2_input") && mm=$(_tel_div "$v" 1000000 0) ||
-        mm=$(awk '/\*/{gsub(/[^0-9]/,"",$2); print $2; exit}' "$d/pp_dpm_mclk" 2>/dev/null)
-    u=$(_tel_read "$d/gpu_busy_percent") || u=n/a
-    vu=$(_tel_div "$(_tel_read "$d/mem_info_vram_used")" 1048576 0)
-    v=$(_tel_read "$h/pwm1") && f=$(_tel_div "$((v * 100))" 255 0) || f=n/a
-    pl=$(_tel_div "$(_tel_read "$h/power1_cap")" 1000000 0)
-    echo "${t:-n/a},${p:-n/a},${cm:-n/a},${mm:-n/a},${u:-n/a},${vu:-n/a},${f:-n/a},n/a,n/a,${pl:-n/a}"
-}
-
-_tel_gpu_intel() {
-    local c=$1 d="$1/device" h t cm v
-    h=$(ls -d "$d"/hwmon/hwmon* 2>/dev/null | head -n1)
-    t=n/a; [[ -n $h ]] && t=$(_tel_div "$(_tel_read "$h/temp1_input")" 1000 0)
-    cm=$(_tel_read "$c/gt_cur_freq_mhz") || cm=$(_tel_read "$d/tile0/gt0/freq0/act_freq") || cm=n/a
-    echo "${t:-n/a},n/a,${cm:-n/a},n/a,n/a,n/a,n/a,n/a,n/a,n/a"
 }
 
 # ----------------------------------------------------------------------------- disks
